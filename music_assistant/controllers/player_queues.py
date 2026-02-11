@@ -970,55 +970,57 @@ class PlayerQueuesController(CoreController):
         # NOTE that we debounce this a bit to account for someone hitting the next button
         # like a madman. This will prevent the player from being overloaded with requests.
         async def _play_index(index: int, debounce: bool) -> None:
-            for attempt in range(5):
-                try:
-                    queue_item = self.get_item(queue_id, index)
-                    if not queue_item:
-                        continue  # guard
-                    await self._load_item(
-                        queue_item,
-                        self._get_next_index(queue_id, index),
-                        is_start=True,
-                        seek_position=seek_position if attempt == 0 else 0,
-                        fade_in=fade_in if attempt == 0 else False,
-                    )
-                    # if we reach this point, loading the item succeeded, break the loop
-                    queue.current_index = index
-                    queue.current_item = queue_item
-                    break
-                except (MediaNotFoundError, AudioError):
-                    # the requested index can not be played.
-                    if queue_item:
-                        self.logger.warning(
-                            "Skipping unplayable item %s (%s)",
-                            queue_item.name,
-                            queue_item.uri,
+            try:
+                for attempt in range(5):
+                    try:
+                        queue_item = self.get_item(queue_id, index)
+                        if not queue_item:
+                            continue  # guard
+                        await self._load_item(
+                            queue_item,
+                            self._get_next_index(queue_id, index),
+                            is_start=True,
+                            seek_position=seek_position if attempt == 0 else 0,
+                            fade_in=fade_in if attempt == 0 else False,
                         )
-                        queue_item.available = False
-                    next_index = self._get_next_index(queue_id, index, allow_repeat=False)
-                    if next_index is None:
-                        raise MediaNotFoundError("No next item available")
-                    index = next_index
-            else:
-                # all attempts to find a playable item failed
-                raise MediaNotFoundError("No playable item found to start playback")
+                        # if we reach this point, loading the item succeeded, break the loop
+                        queue.current_index = index
+                        queue.current_item = queue_item
+                        break
+                    except (MediaNotFoundError, AudioError):
+                        # the requested index can not be played.
+                        if queue_item:
+                            self.logger.warning(
+                                "Skipping unplayable item %s (%s)",
+                                queue_item.name,
+                                queue_item.uri,
+                            )
+                            queue_item.available = False
+                        next_index = self._get_next_index(queue_id, index, allow_repeat=False)
+                        if next_index is None:
+                            raise MediaNotFoundError("No next item available")
+                        index = next_index
+                else:
+                    # all attempts to find a playable item failed
+                    raise MediaNotFoundError("No playable item found to start playback")
 
-            # work out if we need to use flow mode
-            flow_mode = target_player.flow_mode and queue_item.media_type not in (
-                # don't use flow mode for duration-less streams
-                MediaType.RADIO,
-                MediaType.PLUGIN_SOURCE,
-            )
-            await asyncio.sleep(0.5 if debounce else 0.1)
-            queue.flow_mode = flow_mode
-            await self.mass.players.play_media(
-                player_id=queue_id,
-                media=await self.player_media_from_queue_item(queue_item, flow_mode),
-            )
-            queue.current_index = index
-            queue.current_item = queue_item
-            await asyncio.sleep(2)
-            self._transitioning_players.discard(queue_id)
+                # work out if we need to use flow mode
+                flow_mode = target_player.flow_mode and queue_item.media_type not in (
+                    # don't use flow mode for duration-less streams
+                    MediaType.RADIO,
+                    MediaType.PLUGIN_SOURCE,
+                )
+                await asyncio.sleep(0.5 if debounce else 0.1)
+                queue.flow_mode = flow_mode
+                await self.mass.players.play_media(
+                    player_id=queue_id,
+                    media=await self.player_media_from_queue_item(queue_item, flow_mode),
+                )
+                queue.current_index = index
+                queue.current_item = queue_item
+                await asyncio.sleep(2)
+            finally:
+                self._transitioning_players.discard(queue_id)
 
         # we set a flag to notify the update logic that we're transitioning to a new track
         self._transitioning_players.add(queue_id)

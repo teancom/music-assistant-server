@@ -127,6 +127,16 @@ class CompareState(TypedDict):
     output_formats: list[str] | None
 
 
+class _QueueDict(dict[str, PlayerQueue]):
+    """Dict subclass that raises PlayerUnavailableError instead of KeyError."""
+
+    def __getitem__(self, key: str) -> PlayerQueue:
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            raise PlayerUnavailableError(f"Queue {key} is not available") from None
+
+
 class PlayerQueuesController(CoreController):
     """Controller holding all logic to enqueue music for players."""
 
@@ -135,7 +145,7 @@ class PlayerQueuesController(CoreController):
     def __init__(self, mass: MusicAssistant) -> None:
         """Initialize core controller."""
         super().__init__(mass)
-        self._queues: dict[str, PlayerQueue] = {}
+        self._queues: dict[str, PlayerQueue] = _QueueDict()
         self._queue_items: dict[str, list[QueueItem]] = {}
         self._prev_states: dict[str, CompareState] = {}
         self._transitioning_players: set[str] = set()

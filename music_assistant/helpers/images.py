@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import itertools
 import os
 import random
+import tempfile
 from base64 import b64decode
 from collections import OrderedDict
 from collections.abc import Iterable
@@ -49,6 +51,20 @@ def _thumb_cache_filename(thumb_hash: str, size: int | None, image_format: str) 
     if ext == "jpeg":
         ext = "jpg"
     return f"{thumb_hash}_{size or 0}.{ext}"
+
+
+def _is_valid_image(data: bytes, image_format: str) -> bool:
+    """Quick-check that image data is not truncated or corrupt."""
+    if not data or len(data) < 16:
+        return False
+    if image_format == "JPEG":
+        # A valid JPEG must end with the EOI marker (FF D9)
+        return data[-2:] == b"\xff\xd9"
+    if image_format == "PNG":
+        # A valid PNG must end with the IEND chunk
+        return b"IEND" in data[-12:]
+    # For other formats, accept as-is
+    return True
 
 
 def _get_from_memory_cache(key: str) -> bytes | None:
@@ -138,8 +154,13 @@ async def get_image_thumb(
     if await asyncio.to_thread(os.path.isfile, cache_filepath):
         async with aiofiles.open(cache_filepath, "rb") as f:
             thumb_data = cast("bytes", await f.read())
-        _put_in_memory_cache(cache_filename, thumb_data)
-        return thumb_data
+        # Validate cached image — discard corrupt/truncated files
+        if _is_valid_image(thumb_data, image_format):
+            _put_in_memory_cache(cache_filename, thumb_data)
+            return thumb_data
+        # Remove corrupt cache entry so it gets regenerated
+        with contextlib.suppress(OSError):
+            await asyncio.to_thread(os.unlink, cache_filepath)
 
     # 3. Generate thumbnail (de-duplicated across concurrent requests)
     task: asyncio.Task[bytes] = mass.create_task(
@@ -200,11 +221,23 @@ async def _generate_and_cache_thumb(
 
         thumb_data = await asyncio.to_thread(_create_image)
 
-    # Persist to disk cache (best-effort, don't fail on I/O errors)
+    # Persist to disk cache (best-effort, don't fail on I/O errors).
+    # Use atomic write (temp file + rename) to prevent concurrent readers
+    # from seeing a partially-written file, which causes image corruption.
     try:
-        await asyncio.to_thread(os.makedirs, os.path.dirname(cache_filepath), exist_ok=True)
-        async with aiofiles.open(cache_filepath, "wb") as f:
-            await f.write(thumb_data)
+        cache_dir = os.path.dirname(cache_filepath)
+        await asyncio.to_thread(os.makedirs, cache_dir, exist_ok=True)
+        fd, tmp_path = await asyncio.to_thread(
+            tempfile.mkstemp, dir=cache_dir, suffix=".tmp"
+        )
+        try:
+            async with aiofiles.open(fd, "wb", closefd=True) as f:
+                await f.write(thumb_data)
+            await asyncio.to_thread(os.replace, tmp_path, cache_filepath)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(os.unlink, tmp_path)
+            raise
     except OSError:
         pass
 

@@ -755,12 +755,45 @@ class Player(ABC):
         """Return the player icon."""
         return cast("str", self._config.get_value(CONF_ENTRY_PLAYER_ICON.key))
 
+    def _resolve_control_config(self, conf_key: str) -> str | None:
+        """Return the explicitly configured control value, or None if not set.
+
+        If a value is explicitly configured (raw value is not None), it is always returned
+        — even if it doesn't currently resolve to a registered player or control. This
+        handles the case where protocol players register asynchronously and the configured
+        player will appear shortly after startup.
+
+        Returns None only when no value has been explicitly configured, signaling the
+        caller to fall through to auto-detection.
+
+        :param conf_key: The config key to look up (e.g. CONF_VOLUME_CONTROL).
+        """
+        conf = self.mass.config.get_raw_player_config_value(self.player_id, conf_key)
+        if conf is None:
+            return None
+        conf_str = str(conf)
+        if not conf_str:
+            return None
+        if (
+            conf_str not in (PLAYER_CONTROL_NATIVE, PLAYER_CONTROL_FAKE, PLAYER_CONTROL_NONE)
+            and not self.mass.players.get_player(conf_str)
+            and not self.mass.players.get_player_control(conf_str)
+        ):
+            self.logger.debug(
+                "Configured %s value '%s' for player %s does not currently resolve "
+                "to a registered player/control",
+                conf_key,
+                conf_str,
+                self.player_id,
+            )
+        return conf_str
+
     @cached_property
     @final
     def power_control(self) -> str:
         """Return the power control type."""
-        if conf := self.mass.config.get_raw_player_config_value(self.player_id, CONF_POWER_CONTROL):
-            return str(conf)
+        if resolved := self._resolve_control_config(CONF_POWER_CONTROL):
+            return resolved
         # not explicitly set, use native if supported
         if PlayerFeature.POWER in self.supported_features:
             return PLAYER_CONTROL_NATIVE
@@ -773,10 +806,8 @@ class Player(ABC):
     @final
     def volume_control(self) -> str:
         """Return the volume control type."""
-        if conf := self.mass.config.get_raw_player_config_value(
-            self.player_id, CONF_VOLUME_CONTROL
-        ):
-            return str(conf)
+        if resolved := self._resolve_control_config(CONF_VOLUME_CONTROL):
+            return resolved
         # not explicitly set, use native if supported
         if PlayerFeature.VOLUME_SET in self.supported_features:
             return PLAYER_CONTROL_NATIVE
@@ -789,8 +820,8 @@ class Player(ABC):
     @final
     def mute_control(self) -> str:
         """Return the mute control type."""
-        if conf := self.mass.config.get_raw_player_config_value(self.player_id, CONF_MUTE_CONTROL):
-            return str(conf)
+        if resolved := self._resolve_control_config(CONF_MUTE_CONTROL):
+            return resolved
         # not explicitly set, use native if supported
         if PlayerFeature.VOLUME_MUTE in self.supported_features:
             return PLAYER_CONTROL_NATIVE

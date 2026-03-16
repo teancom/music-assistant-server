@@ -11,6 +11,7 @@ from bandcamp_async_api import (
     BandcampMustBeLoggedInError,
     BandcampNotFoundError,
     BandcampRateLimitError,
+    FeedStory,
     SearchResultAlbum,
     SearchResultArtist,
     SearchResultTrack,
@@ -38,8 +39,10 @@ from music_assistant_models.media_items import (
     ItemMapping,
     MediaItemImage,
     MediaItemType,
+    RecommendationFolder,
     SearchResults,
     Track,
+    UniqueList,
 )
 from music_assistant_models.provider import ProviderManifest
 from music_assistant_models.streamdetails import StreamDetails
@@ -57,6 +60,7 @@ from .constants import (
     BROWSE_WISHLIST,
     CACHE_EMPTY_RESULTS,
     CACHE_METADATA,
+    CACHE_RECOMMENDATIONS,
     CACHE_USER_LISTS,
     CONF_IDENTITY,
     CONF_TOP_TRACKS_LIMIT,
@@ -729,6 +733,58 @@ class BandcampProvider(MusicProvider):
             provider=self.instance_id,
         )
         return folders
+
+    @use_cache(CACHE_RECOMMENDATIONS)
+    async def recommendations(self) -> list[RecommendationFolder]:
+        """Get personalized recommendations from the Bandcamp music feed."""
+        if not self._client.identity:
+            return []
+
+        async with self._map_api_errors("Failed to get Bandcamp feed"):
+            feed = await self._client.get_feed()
+
+        # Categorize stories into recommendation folders
+        new_releases: list[Album | Track] = []
+        fans_collecting: list[Album | Track] = []
+
+        for story in feed.stories:
+            item = await self._resolve_feed_story(story)
+            if item is None:
+                continue
+            if story.story_type == "nr":
+                new_releases.append(item)
+            elif story.story_type in ("np", "fp"):
+                fans_collecting.append(item)
+
+        result: list[RecommendationFolder] = []
+        if new_releases:
+            result.append(
+                RecommendationFolder(
+                    item_id="feed_new_releases",
+                    provider=self.instance_id,
+                    name="New Releases",
+                    items=UniqueList(new_releases),
+                )
+            )
+        if fans_collecting:
+            result.append(
+                RecommendationFolder(
+                    item_id="feed_fans_collecting",
+                    provider=self.instance_id,
+                    name="Fans Are Collecting",
+                    items=UniqueList(fans_collecting),
+                )
+            )
+        return result
+
+    async def _resolve_feed_story(self, story: FeedStory) -> Album | Track | None:
+        """Resolve a feed story to a full Album or Track, or None on failure."""
+        with suppress(MediaNotFoundError):
+            if story.item_type == "a" or (story.item_type == "p" and story.tralbum_type == "a"):
+                return await self.get_album(f"{story.band_id}-{story.tralbum_id}")
+            if story.item_type == "t" or (story.item_type == "p" and story.tralbum_type == "t"):
+                return await self.get_track(f"{story.band_id}-0-{story.tralbum_id}")
+        return None
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return the content details for the given track.

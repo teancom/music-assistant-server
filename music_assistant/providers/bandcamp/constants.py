@@ -11,7 +11,11 @@ SUPPORTED_FEATURES = {
     ProviderFeature.ARTIST_ALBUMS,
     ProviderFeature.ARTIST_TOPTRACKS,
     ProviderFeature.BROWSE,
+    ProviderFeature.RECOMMENDATIONS,
 }
+
+# Cache TTL for recommendations (feed updates less frequently than user lists)
+CACHE_RECOMMENDATIONS = 3600 * 2  # 2 hours
 
 # Config keys
 CONF_IDENTITY = "identity"

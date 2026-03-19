@@ -1756,6 +1756,14 @@ class PlayerQueuesController(CoreController):
                 media.image_url = self.mass.metadata.get_image_url(
                     queue_item.image, size=500, prefer_stream_server=True
                 )
+        # prefer dynamic stream metadata image (e.g. current track art from radio streams)
+        # over the static media item image (e.g. station logo)
+        if (
+            queue_item.streamdetails
+            and queue_item.streamdetails.stream_metadata
+            and queue_item.streamdetails.stream_metadata.image_url
+        ):
+            media.image_url = queue_item.streamdetails.stream_metadata.image_url
         return media
 
     async def get_artist_tracks(self, artist: Artist) -> list[Track]:

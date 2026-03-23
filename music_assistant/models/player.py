@@ -25,8 +25,15 @@ from music_assistant_models.constants import (
     PLAYER_CONTROL_NATIVE,
     PLAYER_CONTROL_NONE,
 )
-from music_assistant_models.enums import MediaType, PlaybackState, PlayerFeature, PlayerType
+from music_assistant_models.enums import (
+    ImageType,
+    MediaType,
+    PlaybackState,
+    PlayerFeature,
+    PlayerType,
+)
 from music_assistant_models.errors import UnsupportedFeaturedException
+from music_assistant_models.media_items import MediaItemImage
 from music_assistant_models.player import (
     DeviceInfo,
     OutputProtocol,
@@ -1578,13 +1585,26 @@ class Player(ABC):
                 stream_metadata := current_item.streamdetails.stream_metadata
             ):
                 # handle stream metadata in streamdetails (e.g. for radio stream)
+                # prefer stream metadata image (current track art) over static item image
+                if stream_metadata.image_url:
+                    stream_image = MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=stream_metadata.image_url,
+                        provider="url",
+                        remotely_accessible=True,
+                    )
+                    stream_image_url = self.mass.metadata.get_image_url(
+                        stream_image, size=500, image_format="jpeg"
+                    )
+                else:
+                    stream_image_url = None
                 return PlayerMedia(
                     uri=current_item.uri,
                     media_type=current_item.media_type,
                     title=stream_metadata.title or current_item.name,
                     artist=stream_metadata.artist,
                     album=stream_metadata.album or stream_metadata.description or current_item.name,
-                    image_url=(stream_metadata.image_url or item_image_url),
+                    image_url=(stream_image_url or item_image_url),
                     duration=stream_metadata.duration or current_item.duration,
                     source_id=active_queue.queue_id,
                     queue_item_id=current_item.queue_item_id,

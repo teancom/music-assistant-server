@@ -28,6 +28,7 @@ from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
     EventType,
+    ImageType,
     MediaType,
     PlaybackState,
     PlayerType,
@@ -52,6 +53,7 @@ from music_assistant_models.media_items import (
     BrowseFolder,
     Genre,
     ItemMapping,
+    MediaItemImage,
     MediaItemType,
     PlayableMediaItemType,
     Playlist,
@@ -89,7 +91,6 @@ if TYPE_CHECKING:
 
     from music_assistant_models import BackgroundTask
     from music_assistant_models.auth import User
-    from music_assistant_models.media_items.metadata import MediaItemImage
 
     from music_assistant import MusicAssistant
     from music_assistant.models.player import Player
@@ -1763,7 +1764,17 @@ class PlayerQueuesController(CoreController):
             and queue_item.streamdetails.stream_metadata
             and queue_item.streamdetails.stream_metadata.image_url
         ):
-            media.image_url = queue_item.streamdetails.stream_metadata.image_url
+            # wrap the external URL in a MediaItemImage so it can be proxied
+            # through the stream server (players may not reach external URLs directly)
+            stream_image = MediaItemImage(
+                type=ImageType.THUMB,
+                path=queue_item.streamdetails.stream_metadata.image_url,
+                provider="url",
+                remotely_accessible=True,
+            )
+            media.image_url = self.mass.metadata.get_image_url(
+                stream_image, size=500, prefer_stream_server=True
+            )
         return media
 
     async def get_artist_tracks(self, artist: Artist) -> list[Track]:

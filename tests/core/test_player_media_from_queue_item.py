@@ -17,6 +17,7 @@ from music_assistant.controllers.player_queues import PlayerQueuesController
 QUEUE_ID = "test_queue"
 SESSION_ID = "test_session"
 STATIC_IMAGE_URL = "http://mass.local/imageproxy?path=station_logo.png&provider=radio&size=500"
+STREAM_PROXIED_URL = "http://mass.local/imageproxy?path=stream_cover.jpg&provider=url&size=500"
 STREAM_IMAGE_URL = "https://img.radioparadise.com/covers/l/19806.jpg"
 
 
@@ -25,9 +26,15 @@ def _make_controller(queue: PlayerQueue) -> PlayerQueuesController:
     ctrl = object.__new__(PlayerQueuesController)
     ctrl._queues = {queue.queue_id: queue}
 
-    # Mock mass.metadata.get_image_url to return a deterministic URL
+    # Mock mass.metadata.get_image_url to return different URLs based on provider
     mass = MagicMock()
-    mass.metadata.get_image_url.return_value = STATIC_IMAGE_URL
+
+    def _mock_get_image_url(image, **_kwargs):
+        if image.provider == "url":
+            return STREAM_PROXIED_URL
+        return STATIC_IMAGE_URL
+
+    mass.metadata.get_image_url.side_effect = _mock_get_image_url
     ctrl.mass = mass
 
     return ctrl
@@ -117,7 +124,15 @@ async def test_stream_metadata_image_overrides_static_image() -> None:
 
     media = await ctrl.player_media_from_queue_item(queue_item)
 
-    assert media.image_url == STREAM_IMAGE_URL
+    # Should use the proxied stream metadata image, not the static station logo
+    assert media.image_url == STREAM_PROXIED_URL
+    # Verify the stream image was proxied with correct parameters
+    last_call = ctrl.mass.metadata.get_image_url.call_args_list[-1]
+    stream_image_arg = last_call[0][0]
+    assert stream_image_arg.path == STREAM_IMAGE_URL
+    assert stream_image_arg.provider == "url"
+    assert last_call[1]["size"] == 500
+    assert last_call[1]["prefer_stream_server"] is True
 
 
 @pytest.mark.asyncio
@@ -166,7 +181,8 @@ async def test_stream_metadata_image_used_even_without_static_image() -> None:
 
     media = await ctrl.player_media_from_queue_item(queue_item)
 
-    assert media.image_url == STREAM_IMAGE_URL
+    # Should use the proxied stream metadata image
+    assert media.image_url == STREAM_PROXIED_URL
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<opml version="1.0">
+  <head><title>Overcast Podcast Subscriptions</title></head>
+  <body>
+    <outline text="playlists">
+      <outline type="podcast-playlist" title="All Episodes" smart="1" sorting="chronological-by-podcast" sortedEpisodeIds="1001,1002,1003"/>
+      <outline type="podcast-playlist" title="Queue" smart="0" sorting="chronological-by-podcast" includeEpisodeIds="1001,1004"/>
+    </outline>
+    <outline text="feeds">
+      <outline type="rss" overcastId="2001" text="Podcast One" title="Podcast One" xmlUrl="https://example.com/podcast1/feed/" htmlUrl="https://example.com/podcast1/">
+        <outline type="podcast-episode" overcastId="1001" pubDate="2024-03-20T12:00:00-05:00" title="Episode 1 - Fully Played" url="https://example.com/ep1" overcastUrl="https://overcast.fm/+test1" enclosureUrl="https://example.com/ep1.mp3" userUpdatedDate="2024-03-20T12:00:00-05:00" played="1"/>
+        <outline type="podcast-episode" overcastId="1002" pubDate="2024-03-15T12:00:00-05:00" title="Episode 2 - With Progress" url="https://example.com/ep2" overcastUrl="https://overcast.fm/+test2" enclosureUrl="https://example.com/ep2.mp3" userUpdatedDate="2024-03-15T12:00:00-05:00" progress="120"/>
+        <outline type="podcast-episode" overcastId="1003" pubDate="2024-03-10T12:00:00-05:00" title="Episode 3 - Unplayed" url="https://example.com/ep3" overcastUrl="https://overcast.fm/+test3" enclosureUrl="https://example.com/ep3.mp3" userUpdatedDate="2024-03-10T12:00:00-05:00"/>
+        <outline type="podcast-episode" overcastId="1004" pubDate="2024-03-05T12:00:00-05:00" title="Episode 4 - No Enclosure" url="https://example.com/ep4" overcastUrl="https://overcast.fm/+test4" userUpdatedDate="2024-03-05T12:00:00-05:00"/>
+      </outline>
+      <outline type="rss" overcastId="2002" text="Podcast Two" title="Podcast Two" xmlUrl="https://example.com/podcast2/feed/" htmlUrl="https://example.com/podcast2/">
+        <outline type="podcast-episode" overcastId="5001" pubDate="2024-03-18T10:00:00-05:00" title="Episode 1 - Podcast Two" url="https://example.com/ep5" overcastUrl="https://overcast.fm/+test5" enclosureUrl="https://example.com/ep5.mp3" userUpdatedDate="2024-03-18T10:00:00-05:00"/>
+        <outline type="podcast-episode" overcastId="5002" pubDate="2024-03-12T10:00:00-05:00" title="Episode 2 - Podcast Two" url="https://example.com/ep6" overcastUrl="https://overcast.fm/+test6" enclosureUrl="https://example.com/ep6.mp3" userUpdatedDate="2024-03-12T10:00:00-05:00" played="1"/>
+      </outline>
+    </outline>
+  </body>
+</opml>

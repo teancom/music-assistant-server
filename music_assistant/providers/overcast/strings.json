@@ -1,0 +1,18 @@
+{
+  "config_entries": {
+    "session_cookie": {
+      "label": "Session cookie",
+      "description": "Overcast session cookie ('o' cookie). Log in at https://overcast.fm, open browser DevTools, and copy the value of the cookie named 'o'."
+    }
+  },
+  "media": {
+    "folder": {
+      "playlists": { "name": "Playlists" },
+      "podcasts": { "name": "Podcasts" },
+      "unplayed": { "name": "Unplayed" }
+    }
+  },
+  "manifest": {
+    "description": "Stream podcasts from your Overcast subscriptions with bi-directional playback sync."
+  }
+}

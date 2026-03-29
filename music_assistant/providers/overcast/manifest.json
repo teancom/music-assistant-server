@@ -1,0 +1,10 @@
+{
+  "domain": "overcast",
+  "name": "Overcast",
+  "description": "Stream podcasts from your Overcast subscriptions with bi-directional playback sync.",
+  "type": "music",
+  "requirements": ["defusedxml==0.7.1"],
+  "codeowners": ["@teancom"],
+  "multi_instance": true,
+  "stage": "experimental"
+}

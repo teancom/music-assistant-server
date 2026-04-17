@@ -951,6 +951,19 @@ class SendspinPlaybackSession:
                     channel_id=pipeline.channel_id,
                     start_time_us=first_history_start_us if offset == 0 else None,
                 )
+            # DIAG: record the actual historical injection range so dual-stream
+            # ts ranges can be matched back to specific join-catchup events.
+            self.player.logger.debug(
+                "inject_ready_join_historical_pushed player_id=%s channel_id=%s "
+                "first_history_start_us=%d target_end_us=%d inject_duration_us=%d "
+                "bytes=%d",
+                player_id,
+                str(pipeline.channel_id),
+                first_history_start_us,
+                target_end_us,
+                inject_duration_us,
+                len(transformed_history),
+            )
             await self._prefeed_pending_backlog_for_join(state, current_pcm, pending_backlog)
             await self._promote_join_catchup_processor(player_id, pipeline, target_end_us)
             injected_any = True

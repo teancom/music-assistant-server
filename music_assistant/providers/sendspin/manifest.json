@@ -8,7 +8,7 @@
   "codeowners": ["@music-assistant"],
   "credits": ["[Sendspin](https://sendspin-audio.com)"],
   "requirements": [
-    "aiosendspin[server] @ git+https://github.com/teancom/sendspin-aiosendspin.git@debug/logging",
+    "aiosendspin[server] @ git+https://github.com/teancom/sendspin-aiosendspin.git@fix/transformer-cliff-hardening",
     "av==16.1.0"
   ],
   "builtin": true,

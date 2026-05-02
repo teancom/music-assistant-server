@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
-from typing import cast
+from typing import Any, cast
 
 from bandcamp_async_api import (
     BandcampAPIClient,
@@ -686,21 +686,27 @@ class BandcampProvider(MusicProvider):
 
     @use_cache(CACHE_METADATA)
     @throttle_with_retries
-    async def _fetch_discography(self, band_id: int) -> list[DiscographyItem]:
+    async def _fetch_discography(self, band_id: int) -> list[dict[str, Any]]:
         """Fetch a band's discography keyed by band_id (cached).
 
         Real artist (``"{band_id}"``) and synthetic performer
         (``"{band_id}:{slug}"``) lookups both go through this so the
         underlying ``mobile/24/band_details`` call hits once per band per
         cache window, not once per ``prov_artist_id``.
+
+        Returns ``list[dict[str, Any]]`` (not ``list[DiscographyItem]``)
+        because the cache controller's deserialization path falls through to
+        ``isinstance(value, value_type)`` for unrecognized types, and TypedDict
+        does not support runtime ``isinstance`` checks. Callers cast to
+        :class:`DiscographyItem` at the converter boundary.
         """
-        result = await self._client.get_artist_discography(band_id)
-        return cast("list[DiscographyItem]", result)
+        result: list[dict[str, Any]] = await self._client.get_artist_discography(band_id)
+        return result
 
     @staticmethod
     def _filter_discography_by_performer(
-        items: list[DiscographyItem], performer_slug: str
-    ) -> list[DiscographyItem]:
+        items: list[dict[str, Any]], performer_slug: str
+    ) -> list[dict[str, Any]]:
         """Filter discography rows down to those credited to a given performer slug."""
         return [
             item
@@ -910,7 +916,7 @@ class BandcampProvider(MusicProvider):
 
         return [
             self._converters.album_from_discography_item(
-                item,
+                cast("DiscographyItem", item),
                 artist_item_id=self._discography_artist_item_id(item, slug_to_real_id),
             )
             for item in items
@@ -918,7 +924,7 @@ class BandcampProvider(MusicProvider):
 
     @staticmethod
     def _discography_artist_item_id(
-        item: DiscographyItem, slug_to_real_id: dict[str, int | None]
+        item: dict[str, Any], slug_to_real_id: dict[str, int | None]
     ) -> str:
         """Pick the artist item_id for a discography row given pre-resolved lookups.
 

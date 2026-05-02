@@ -438,6 +438,114 @@ async def test_lookup_performer_band_id_skips_label_results(
         assert result == 3658985110
 
 
+async def test_search_resilient_to_lookup_exception_in_one_slug(
+    provider: BandcampProvider,
+) -> None:
+    """One slug's lookup raising must not kill the whole batch.
+
+    ``_resolve_search_artist_ids`` runs lookups in parallel via
+    ``asyncio.gather(..., return_exceptions=True)``; an unexpected
+    exception in any single lookup must degrade that slug to "no own
+    band page" (synthetic fallback) rather than abort the entire search.
+    """
+    label_a_id = 1111111
+    label_b_id = 2222222
+    real_b_band_id = 3658985110
+    label_a = _search_artist_mock(artist_id=label_a_id, name="Label A", is_label=True)
+    label_b = _search_artist_mock(artist_id=label_b_id, name="Label B", is_label=True)
+    album_a = _search_album_mock(artist_id=label_a_id, artist_name="Performer A", album_id=10)
+    album_b = _search_album_mock(artist_id=label_b_id, artist_name="Performer B", album_id=20)
+
+    async def fake_lookup(name: str) -> int | None:
+        if name == "Performer A":
+            raise RuntimeError("boom")
+        if name == "Performer B":
+            return real_b_band_id
+        return None
+
+    with (
+        patch.object(
+            provider._client,
+            "search",
+            new_callable=AsyncMock,
+            return_value=[label_a, label_b, album_a, album_b],
+        ),
+        patch.object(provider, "_lookup_performer_band_id", side_effect=fake_lookup),
+        patch.object(
+            provider, "get_artist", new_callable=AsyncMock, return_value=Mock(spec=Artist)
+        ),
+    ):
+        results = await provider.search("test", [MediaType.ALBUM], limit=20)
+
+    # Performer A's lookup blew up → falls through to synthetic.
+    # Performer B's lookup succeeded → uses the real band_id.
+    album_artist_ids = {next(iter(cast("Album", a).artists)).item_id for a in results.albums}
+    assert f"{label_a_id}:performer-a" in album_artist_ids
+    assert str(real_b_band_id) in album_artist_ids
+
+
+async def test_lookup_performer_band_id_corrupt_cache_falls_through(
+    provider: BandcampProvider, mass_mock: Mock
+) -> None:
+    """A non-integer cache payload is discarded and a fresh fetch runs.
+
+    Defensive guard: if the cache returns a value that can't be coerced
+    to int (schema change, manual edit, …), the lookup must NOT raise
+    ``ValueError`` into the parallel ``asyncio.gather`` — it must log,
+    discard the entry, and re-fetch from the upstream API.
+    """
+    mass_mock.cache.get.return_value = "not-an-int"
+
+    real_band_id = 3658985110
+    real_artist = _search_artist_mock(artist_id=real_band_id, name="Apollo Brown")
+    with patch.object(
+        provider._client, "search", new_callable=AsyncMock, return_value=[real_artist]
+    ) as mock_search:
+        result = await provider._lookup_performer_band_id("Apollo Brown")
+
+    assert result == real_band_id
+    mock_search.assert_awaited_once_with("Apollo Brown")
+
+
+async def test_search_suppresses_retries_exhausted_from_get_artist(
+    provider: BandcampProvider,
+) -> None:
+    """``RetriesExhausted`` from ``get_artist`` must not crash an in-progress search.
+
+    The materialized-artist emission is best-effort — its failure should
+    leave album/track results intact rather than propagate up.
+    """
+    label_id = 4119123456
+    apollo_band_id = 3658985110
+    label_band = _search_artist_mock(artist_id=label_id, name="Hip Dozer", is_label=True)
+    night_moves = _search_album_mock(artist_id=label_id, artist_name="Apollo Brown", album_id=1)
+    secondary_response = [_search_artist_mock(artist_id=apollo_band_id, name="Apollo Brown")]
+
+    async def fake_search(query: str) -> list[Mock]:
+        if query == "Apollo Brown":
+            return secondary_response
+        return [label_band, night_moves]
+
+    with (
+        patch.object(provider._client, "search", side_effect=fake_search),
+        patch.object(
+            provider,
+            "get_artist",
+            new_callable=AsyncMock,
+            side_effect=RetriesExhausted("throttle exhausted"),
+        ),
+    ):
+        results = await provider.search("Night Moves", [MediaType.ALBUM, MediaType.ARTIST])
+
+    # Album result still produced despite the artist-materialization failure.
+    assert len(results.albums) == 1
+    # The artist-materialization branch was suppressed → no Apollo Brown
+    # in artists, but Hip Dozer (the in-batch `b` row) is still surfaced.
+    artist_ids = {a.item_id for a in results.artists}
+    assert str(label_id) in artist_ids
+    assert str(apollo_band_id) not in artist_ids
+
+
 async def test_get_album_unifies_label_release_to_real_performer_band(
     provider: BandcampProvider,
 ) -> None:
@@ -920,6 +1028,75 @@ async def test_get_artist_albums_label_uses_band_id(provider: BandcampProvider) 
         artists = list(result[0].artists)
         # artist_name == band_name → real artist ID for the album's own band.
         assert artists[0].item_id == "9999"
+
+
+async def test_get_artist_albums_label_unifies_performer_to_real_band(
+    provider: BandcampProvider,
+) -> None:
+    """Listing a label's discography unifies label-released performers to their real band pages.
+
+    When the user navigates to a label artist (e.g. Hip Dozer), the
+    discography listing must use real performer band_ids — matching what
+    ``get_album`` would emit on click. Otherwise the album list shows
+    synthetic IDs while the album detail shows real IDs, sending the
+    same artist-name link to two different destinations.
+    """
+    label_id = 4119123456
+    apollo_band_id = 3658985110
+    mock_discography = [
+        {
+            "item_type": "album",
+            "band_id": label_id,
+            "item_id": 686338649,
+            "title": "Night Moves",
+            "artist_name": "Apollo Brown",
+            "band_name": "Hip Dozer",
+            "art_id": 2560657053,
+            "release_date": "01 Jan 2020 00:00:00 GMT",
+        },
+        {
+            "item_type": "album",
+            "band_id": label_id,
+            "item_id": 100,
+            "title": "Label Compilation",
+            # Band-by-itself row: artist_name == band_name → no lookup.
+            "artist_name": "Hip Dozer",
+            "band_name": "Hip Dozer",
+            "art_id": 1234,
+            "release_date": "01 Jun 2021 00:00:00 GMT",
+        },
+    ]
+    secondary_response = [_search_artist_mock(artist_id=apollo_band_id, name="Apollo Brown")]
+
+    with (
+        patch.object(
+            provider._client,
+            "get_artist_discography",
+            new_callable=AsyncMock,
+            return_value=mock_discography,
+        ),
+        patch.object(
+            provider._client,
+            "search",
+            new_callable=AsyncMock,
+            return_value=secondary_response,
+        ) as mock_search,
+    ):
+        result = await provider.get_artist_albums(str(label_id))
+
+    by_name = {album.name: album for album in result}
+    apollo_album = by_name["Night Moves"]
+    label_album = by_name["Label Compilation"]
+
+    # Label-released performer with own band page → real band_id, not synthetic.
+    assert next(iter(apollo_album.artists)).item_id == str(apollo_band_id)
+    # Band-by-itself row: artist_name slug == band_name slug → plain band_id,
+    # no lookup attempted.
+    assert next(iter(label_album.artists)).item_id == str(label_id)
+
+    # One lookup for the unique unmapped performer; the band-by-itself row
+    # short-circuited before reaching the lookup.
+    mock_search.assert_awaited_once_with("Apollo Brown")
 
 
 async def test_get_artist_albums_synthetic_id_filters_discography(

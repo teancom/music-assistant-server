@@ -313,13 +313,22 @@ class BandcampConverters:
         )
         return output
 
-    def album_from_discography_item(self, item: DiscographyItem) -> MAAlbum:
+    def album_from_discography_item(
+        self, item: DiscographyItem, *, artist_item_id: str | None = None
+    ) -> MAAlbum:
         """Convert a raw discography dict to MA Album format.
 
         Discography items come from the band_details API and contain summary
         data (title, art_id, release_date string) without full album details.
         Fields not available from the discography endpoint (url, description)
         are omitted and populated later when get_album fetches full details.
+
+        :param artist_item_id: Resolved artist item_id chosen by the
+            provider (which can do an async secondary lookup to redirect
+            label-released performers to their own real band page when
+            one exists). If omitted, the converter resolves locally via
+            slug equality, returning either ``{band_id}`` or a synthetic
+            ``{band_id}:{slug}``.
         """
         band_id = item.get("band_id", 0)
         item_id = item.get("item_id", 0)
@@ -329,7 +338,7 @@ class BandcampConverters:
         performer = item.get("artist_name")
         band_name = item.get("band_name") or ""
         display_name = performer or band_name
-        artist_item_id = _resolve_artist_id(
+        artist_item_id = artist_item_id or _resolve_artist_id(
             band_id=band_id, performer=performer, band_name=band_name
         )
 

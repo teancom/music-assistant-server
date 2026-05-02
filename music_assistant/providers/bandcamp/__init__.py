@@ -38,6 +38,7 @@ from music_assistant_models.errors import (
     LoginFailed,
     MediaNotFoundError,
     ResourceTemporarilyUnavailable,
+    RetriesExhausted,
 )
 from music_assistant_models.media_items import (
     Album,
@@ -286,7 +287,12 @@ class BandcampProvider(MusicProvider):
                     # Skip — surfacing it here would re-introduce a band the
                     # user wasn't searching for.
                     continue
-                with suppress(MediaNotFoundError, ResourceTemporarilyUnavailable):
+                # Materializing the looked-up artist is a best-effort augmentation
+                # of search results — its failure must not crash a search that
+                # already produced album/track hits. ``RetriesExhausted`` covers
+                # the case where the upstream throttler has already exhausted
+                # its retry budget on this call.
+                with suppress(MediaNotFoundError, ResourceTemporarilyUnavailable, RetriesExhausted):
                     results.artists = [*results.artists, await self.get_artist(artist_item_id)]
 
         if synthetic_artists:
@@ -326,19 +332,7 @@ class BandcampProvider(MusicProvider):
             if slug:
                 slug_to_name.setdefault(slug, performer)
 
-        # Run all lookups in parallel; cache hits are essentially free, so
-        # this bounds latency to a single roundtrip on first encounter.
-        slugs = list(slug_to_name)
-        lookup_results: list[int | None] = (
-            list(
-                await asyncio.gather(
-                    *(self._lookup_performer_band_id(slug_to_name[slug]) for slug in slugs)
-                )
-            )
-            if slugs
-            else []
-        )
-        slug_to_real_id: dict[str, int | None] = dict(zip(slugs, lookup_results, strict=True))
+        slug_to_real_id = await self._lookup_performer_band_ids_parallel(slug_to_name)
 
         resolved: dict[int, str] = {}
         for row in rows:
@@ -353,6 +347,41 @@ class BandcampProvider(MusicProvider):
                 continue
             resolved[id(row)] = make_artist_id(row.artist_id, performer)
         return resolved
+
+    async def _lookup_performer_band_ids_parallel(
+        self, names_by_slug: dict[str, str]
+    ) -> dict[str, int | None]:
+        """Look up multiple performer→band_id mappings concurrently.
+
+        Cache hits are free, so this bounds latency to a single roundtrip on
+        first encounter. ``return_exceptions=True`` keeps a single bad lookup
+        from killing the whole batch — an unexpected error degrades to "no
+        own band page found" for that performer, falling through to the
+        synthetic path.
+
+        :param names_by_slug: Mapping of ``performer_slug`` (the cache key) to
+            the original performer name (the autocomplete query).
+        :returns: Mapping of slug to ``band_id | None``.
+        """
+        if not names_by_slug:
+            return {}
+        slugs = list(names_by_slug)
+        raw_results = await asyncio.gather(
+            *(self._lookup_performer_band_id(names_by_slug[slug]) for slug in slugs),
+            return_exceptions=True,
+        )
+        out: dict[str, int | None] = {}
+        for slug, result in zip(slugs, raw_results, strict=True):
+            if isinstance(result, BaseException):
+                self.logger.warning(
+                    "performer band lookup failed for %r: %s",
+                    names_by_slug[slug],
+                    result,
+                )
+                out[slug] = None
+            else:
+                out[slug] = result
+        return out
 
     async def _lookup_performer_band_id(self, performer_name: str) -> int | None:
         """Find the band_id for a performer who has their own Bandcamp page.
@@ -379,8 +408,19 @@ class BandcampProvider(MusicProvider):
         cache_key = f"performer_band_id.{target_slug}"
         cached = await self.mass.cache.get(cache_key, provider=self.instance_id)
         if cached is not None:
-            cached_int = int(cached)
-            return cached_int or None
+            try:
+                cached_int = int(cached)
+            except (ValueError, TypeError):
+                # Corrupt cache entry (schema change, manual edit, …); fall
+                # through to a fresh fetch. We don't want one bad entry to
+                # crash an entire `_resolve_search_artist_ids` gather.
+                self.logger.warning(
+                    "Discarding corrupt performer_band_id cache for %r: %r",
+                    target_slug,
+                    cached,
+                )
+            else:
+                return cached_int or None
         band_id = await self._fetch_performer_band_id(performer_name, target_slug)
         await self.mass.cache.set(
             cache_key,
@@ -849,7 +889,53 @@ class BandcampProvider(MusicProvider):
         ]
         if performer_slug is not None:
             items = self._filter_discography_by_performer(items, performer_slug)
-        return [self._converters.album_from_discography_item(item) for item in items]
+
+        # Pre-resolve performer→band lookups for label-released items so the
+        # discography listing's artist links match what get_album would
+        # produce on click — otherwise list view (synthetic) and detail view
+        # (real band_id) would diverge for the same performer. Cache hits
+        # are free; first-visit cost on a label with N distinct performers
+        # is throttler-bounded to ~ceil(N / rate_limit) windows.
+        names_by_slug: dict[str, str] = {}
+        for item in items:
+            performer = str(item.get("artist_name") or "")
+            band_name = str(item.get("band_name") or "")
+            if not performer:
+                continue
+            slug = slugify_performer(performer)
+            if not slug or slug == slugify_performer(band_name):
+                continue
+            names_by_slug.setdefault(slug, performer)
+        slug_to_real_id = await self._lookup_performer_band_ids_parallel(names_by_slug)
+
+        return [
+            self._converters.album_from_discography_item(
+                item,
+                artist_item_id=self._discography_artist_item_id(item, slug_to_real_id),
+            )
+            for item in items
+        ]
+
+    @staticmethod
+    def _discography_artist_item_id(
+        item: DiscographyItem, slug_to_real_id: dict[str, int | None]
+    ) -> str:
+        """Pick the artist item_id for a discography row given pre-resolved lookups.
+
+        Pure function: caller provides the lookup results in
+        ``slug_to_real_id`` (built by :meth:`_lookup_performer_band_ids_parallel`).
+        Mirrors :meth:`_resolve_artist_item_id` but skips the I/O so the whole
+        discography can be converted in one synchronous comprehension.
+        """
+        band_id = int(item.get("band_id") or 0)
+        performer = str(item.get("artist_name") or "")
+        band_name = str(item.get("band_name") or "")
+        if not performer or slugify_performer(performer) == slugify_performer(band_name):
+            return str(band_id)
+        real_id = slug_to_real_id.get(slugify_performer(performer))
+        if real_id is not None:
+            return str(real_id)
+        return make_artist_id(band_id, performer)
 
     @use_cache(CACHE_METADATA)
     @throttle_with_retries

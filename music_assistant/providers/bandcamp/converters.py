@@ -204,21 +204,27 @@ class BandcampConverters:
         album_image_url: str = "",
         *,
         tralbum_artist: str | None = None,
+        artist_item_id: str | None = None,
     ) -> MATrack:
         """Convert a Track object from the API to MA Track format.
 
         :param tralbum_artist: The per-album performer credit
             (``BCAlbum.tralbum_artist`` for tracks within an album, or
             ``BCTrack.tralbum_artist`` for standalone tracks). When set
-            and different from the band's own name, the artist link uses
-            a synthetic ``{band_id}:{slug}`` ID and the displayed artist
+            and different from the band's own name, the displayed artist
             name is the performer rather than the band.
+        :param artist_item_id: Resolved artist item_id chosen by the
+            provider (which can do an async secondary lookup to redirect
+            label-released performers to their own real band page when
+            one exists). If omitted, the converter resolves locally via
+            slug equality, returning either ``{band_id}`` or a synthetic
+            ``{band_id}:{slug}``.
         """
         album_id = album_id or 0
         _, bitrate, content_type = self.streaming_url_from_api(track.streaming_url or {})
         band_name = track.artist.name
         display_name = tralbum_artist or band_name
-        artist_item_id = _resolve_artist_id(
+        artist_item_id = artist_item_id or _resolve_artist_id(
             band_id=track.artist.id, performer=tralbum_artist, band_name=band_name
         )
         output = MATrack(
@@ -373,12 +379,20 @@ class BandcampConverters:
             )
         return output
 
-    def album_from_api(self, album: APIAlbum) -> MAAlbum:
-        """Convert an API Album object to MA Album format."""
+    def album_from_api(self, album: APIAlbum, *, artist_item_id: str | None = None) -> MAAlbum:
+        """Convert an API Album object to MA Album format.
+
+        :param artist_item_id: Resolved artist item_id chosen by the
+            provider (which can do an async secondary lookup to redirect
+            label-released performers to their own real band page when
+            one exists). If omitted, the converter resolves locally via
+            slug equality, returning either ``{band_id}`` or a synthetic
+            ``{band_id}:{slug}``.
+        """
         album_id = f"{album.artist.id}-{album.id}"
         band_name = album.artist.name
         display_name = album.tralbum_artist or band_name
-        artist_item_id = _resolve_artist_id(
+        artist_item_id = artist_item_id or _resolve_artist_id(
             band_id=album.artist.id, performer=album.tralbum_artist, band_name=band_name
         )
         output = MAAlbum(

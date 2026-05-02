@@ -211,7 +211,9 @@ def _search_album_mock(
     return item
 
 
-def _search_artist_mock(*, artist_id: int = 123, name: str = "Test Artist") -> Mock:
+def _search_artist_mock(
+    *, artist_id: int = 123, name: str = "Test Artist", is_label: bool = False
+) -> Mock:
     """Construct a SearchResultArtist mock with concrete attribute values."""
     item = Mock(spec=SearchResultArtist)
     item.id = artist_id
@@ -219,6 +221,7 @@ def _search_artist_mock(*, artist_id: int = 123, name: str = "Test Artist") -> M
     item.url = ""
     item.image_url = None
     item.tags = None
+    item.is_label = is_label
     return item
 
 
@@ -309,6 +312,166 @@ async def test_search_does_not_duplicate_existing_artists(
         results = await provider.search("Apollo Brown", [MediaType.ARTIST], limit=10)
 
         assert [a.item_id for a in results.artists] == [str(band_id)]
+
+
+async def test_search_unifies_label_release_to_real_performer_band(
+    provider: BandcampProvider,
+) -> None:
+    """A label-released album whose performer has their own band page links to the real band.
+
+    Regression test for music-assistant/support#5389 / Apollo Brown on
+    Hip Dozer. When a user searches by album name (e.g. "Night Moves"),
+    Bandcamp's autocomplete returns the album row with ``band_id`` =
+    Hip Dozer (the label) and ``artist_name`` = "Apollo Brown" — but no
+    ``b`` row for Apollo Brown's own page in the same response. The
+    secondary autocomplete lookup for "Apollo Brown" finds the real
+    band, and the album's artist link uses that real ``band_id``
+    instead of a synthetic ``{label_id}:apollo-brown``. This unifies the
+    artist with what direct-search-by-artist would find.
+    """
+    label_id = 4119123456
+    apollo_band_id = 3658985110
+    hipdozer_band = _search_artist_mock(artist_id=label_id, name="Hip Dozer", is_label=True)
+    night_moves = _search_album_mock(artist_id=label_id, artist_name="Apollo Brown", album_id=1)
+
+    # Primary autocomplete for "Night Moves" returns the album + label.
+    # Secondary lookup for "Apollo Brown" returns the real artist `b` row.
+    primary_response = [hipdozer_band, night_moves]
+    secondary_response = [_search_artist_mock(artist_id=apollo_band_id, name="Apollo Brown")]
+
+    apollo_real_artist = Mock(spec=Artist)
+    apollo_real_artist.item_id = str(apollo_band_id)
+
+    async def fake_search(query: str) -> list[Mock]:
+        if query == "Apollo Brown":
+            return secondary_response
+        return primary_response
+
+    with (
+        patch.object(provider._client, "search", side_effect=fake_search) as mock_search,
+        patch.object(
+            provider, "get_artist", new_callable=AsyncMock, return_value=apollo_real_artist
+        ) as mock_get_artist,
+    ):
+        results = await provider.search(
+            "Night Moves", [MediaType.ALBUM, MediaType.ARTIST], limit=10
+        )
+
+        # The album's artist link points to Apollo Brown's real band_id,
+        # NOT a synthetic `{label_id}:apollo-brown`.
+        album_artist_ids = {next(iter(cast("Album", a).artists)).item_id for a in results.albums}
+        assert album_artist_ids == {str(apollo_band_id)}
+
+        # The artist results include Apollo Brown materialized via get_artist.
+        artist_ids = {a.item_id for a in results.artists}
+        assert str(apollo_band_id) in artist_ids
+        # No synthetic artist for a performer who has their own band page.
+        assert not any(":" in a.item_id for a in results.artists)
+        # Hip Dozer (the label) is still surfaced — it was a `b` row in
+        # the primary response and matches MediaType.ARTIST directly.
+        assert str(label_id) in artist_ids
+
+        # Two autocomplete calls: the primary search + one secondary
+        # lookup for "Apollo Brown". (Hip Dozer didn't need a lookup —
+        # it was already the page owner.)
+        assert mock_search.call_count == 2
+        mock_get_artist.assert_awaited_once_with(str(apollo_band_id))
+
+
+async def test_lookup_performer_band_id_caches_negative_result(
+    provider: BandcampProvider, mass_mock: Mock
+) -> None:
+    """A performer with no own band page caches the 'not found' outcome.
+
+    The cache layer treats ``None`` as a miss, so we store integer 0 as
+    the negative-cache sentinel. A repeated lookup for the same slug
+    must NOT trigger a second autocomplete call.
+    """
+    cache_data: dict[str, int] = {}
+
+    async def fake_get(key: str, **_: object) -> int | None:
+        return cache_data.get(key)
+
+    async def fake_set(key: str, value: int, **_: object) -> None:
+        cache_data[key] = value
+
+    mass_mock.cache.get.side_effect = fake_get
+    mass_mock.cache.set.side_effect = fake_set
+
+    # Secondary search returns no matching b-row for "Mortaja" — the
+    # response contains an unrelated label.
+    unrelated = _search_artist_mock(artist_id=441379041, name="audiophob", is_label=True)
+    with patch.object(
+        provider._client, "search", new_callable=AsyncMock, return_value=[unrelated]
+    ) as mock_search:
+        first = await provider._lookup_performer_band_id("Mortaja")
+        second = await provider._lookup_performer_band_id("Mortaja")
+
+        assert first is None
+        assert second is None
+        # The negative result is cached; the upstream search runs once.
+        assert mock_search.call_count == 1
+        # Sentinel 0 was written for the slug.
+        assert cache_data["performer_band_id.mortaja"] == 0
+
+
+async def test_lookup_performer_band_id_skips_label_results(
+    provider: BandcampProvider,
+) -> None:
+    """A label that shares a performer's exact name must not be returned as a band.
+
+    Without the ``is_label`` filter, a label called "Apollo Brown"
+    (rare but possible) would shadow the actual artist's band page.
+    """
+    label_with_same_name = _search_artist_mock(artist_id=999, name="Apollo Brown", is_label=True)
+    real_artist = _search_artist_mock(artist_id=3658985110, name="Apollo Brown")
+
+    # Order matters: even when the label appears first, we skip it and
+    # return the non-label match.
+    with patch.object(
+        provider._client,
+        "search",
+        new_callable=AsyncMock,
+        return_value=[label_with_same_name, real_artist],
+    ):
+        result = await provider._lookup_performer_band_id("Apollo Brown")
+        assert result == 3658985110
+
+
+async def test_get_album_unifies_label_release_to_real_performer_band(
+    provider: BandcampProvider,
+) -> None:
+    """Fetching a label-released album embeds the performer's real band_id.
+
+    Regression test paralleling
+    :func:`test_search_unifies_label_release_to_real_performer_band` but
+    on the album-fetch path. When MA opens or syncs a label-released
+    album, the artist link must point to the performer's own band page
+    rather than a synthetic ID — otherwise list view and detail view
+    diverge.
+    """
+    label_id = 4119123456
+    apollo_band_id = 3658985110
+
+    api_album = Mock()
+    api_album.artist.id = label_id
+    api_album.artist.name = "Hip Dozer"
+    api_album.tralbum_artist = "Apollo Brown"
+
+    secondary_response = [_search_artist_mock(artist_id=apollo_band_id, name="Apollo Brown")]
+
+    with (
+        patch.object(provider._client, "get_album", new_callable=AsyncMock, return_value=api_album),
+        patch.object(
+            provider._client, "search", new_callable=AsyncMock, return_value=secondary_response
+        ) as mock_search,
+        patch.object(provider._converters, "album_from_api") as mock_converter,
+    ):
+        mock_converter.return_value = Mock()
+        await provider.get_album(f"{label_id}-456")
+
+        mock_converter.assert_called_once_with(api_album, artist_item_id=str(apollo_band_id))
+        mock_search.assert_awaited_once_with("Apollo Brown")
 
 
 async def test_search_without_identity(provider: BandcampProvider) -> None:
@@ -556,6 +719,9 @@ async def test_get_artist_not_found(provider: BandcampProvider) -> None:
 async def test_get_album_success(provider: BandcampProvider) -> None:
     """Test successful album retrieval."""
     mock_album = Mock()
+    mock_album.artist.id = 123
+    mock_album.artist.name = "Test Band"
+    mock_album.tralbum_artist = None
 
     with (
         patch.object(provider._client, "get_album", new_callable=AsyncMock) as mock_get_album,
@@ -567,6 +733,8 @@ async def test_get_album_success(provider: BandcampProvider) -> None:
         result = await provider.get_album("123-456")
 
         mock_get_album.assert_called_once_with(123, 456)
+        # Plain band_id passes through when there's no performer credit.
+        mock_converter.assert_called_once_with(mock_album, artist_item_id="123")
         assert result is not None
 
 
@@ -575,6 +743,9 @@ async def test_get_track_success(provider: BandcampProvider) -> None:
     mock_album = Mock()
     mock_track = Mock()
     mock_album.tracks = [mock_track]
+    mock_album.artist.id = 123
+    mock_album.artist.name = "Test Band"
+    mock_album.tralbum_artist = None
     mock_track.id = 789
 
     with (
@@ -601,8 +772,11 @@ async def test_get_track_standalone(provider: BandcampProvider) -> None:
     mock_api_track.album = mock_album_obj
     # Standalone single tracks carry their own performer credit; the
     # provider forwards it to the converter so synthetic IDs are emitted
-    # for label-released singles.
+    # for label-released singles. Performer matches band name here so the
+    # secondary lookup short-circuits to the plain band_id.
     mock_api_track.tralbum_artist = "Test Artist"
+    mock_api_track.artist.id = 123
+    mock_api_track.artist.name = "Test Artist"
 
     with (
         patch.object(provider._client, "get_track", new_callable=AsyncMock) as mock_get_track,
@@ -620,6 +794,7 @@ async def test_get_track_standalone(provider: BandcampProvider) -> None:
             album_name="Standalone Album",
             album_image_url="http://example.com/art.jpg",
             tralbum_artist="Test Artist",
+            artist_item_id="123",
         )
         assert result is not None
 
@@ -629,6 +804,8 @@ async def test_get_track_standalone_no_album(provider: BandcampProvider) -> None
     mock_api_track = Mock()
     mock_api_track.album = None
     mock_api_track.tralbum_artist = None
+    mock_api_track.artist.id = 123
+    mock_api_track.artist.name = "Test Band"
 
     with (
         patch.object(provider._client, "get_track", new_callable=AsyncMock) as mock_get_track,
@@ -646,6 +823,7 @@ async def test_get_track_standalone_no_album(provider: BandcampProvider) -> None
             album_name="",
             album_image_url="",
             tralbum_artist=None,
+            artist_item_id="123",
         )
         assert result is not None
 
@@ -667,6 +845,9 @@ async def test_get_album_tracks_success(provider: BandcampProvider) -> None:
     mock_album.tracks = [mock_track]
     mock_album.title = "Test Album"
     mock_album.art_url = "http://example.com/art.jpg"
+    mock_album.artist.id = 123
+    mock_album.artist.name = "Test Band"
+    mock_album.tralbum_artist = None
 
     with (
         patch.object(provider._client, "get_album", new_callable=AsyncMock) as mock_get_album,

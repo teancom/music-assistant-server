@@ -55,7 +55,9 @@ def _retry_transient_transport_errors[ClientT, **P, R](
 class AppleMusicAPIClient:
     """Handles all HTTP communication with the Apple Music API."""
 
-    throttler = ThrottlerManager(rate_limit=1, period=2, initial_backoff=15)
+    # Tuning knobs under observation: watch dev logs for 429s (raise period) or
+    # "Apple Music API Timeout" 504s (lower the page limit in get_all_items).
+    throttler = ThrottlerManager(rate_limit=1, period=1, initial_backoff=15)
 
     def __init__(self, provider: AppleMusicProvider) -> None:
         """Initialize the API client."""
@@ -166,7 +168,7 @@ class AppleMusicAPIClient:
 
     async def get_all_items(self, endpoint: str, key: str = "data", **kwargs: Any) -> list[dict]:
         """Get all items from a paged list."""
-        limit = 50
+        limit = 100  # Apple's documented per-page maximum for library endpoints
         offset = 0
         all_items: list[dict] = []
         while True:

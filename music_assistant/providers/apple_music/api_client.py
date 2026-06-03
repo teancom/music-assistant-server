@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import sys
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Concatenate
 
@@ -50,6 +51,40 @@ def _retry_transient_transport_errors[ClientT, **P, R](
             ) from err
 
     return wrapper
+
+
+# --- DEBUG (throwaway, branch: debug/apple-music-memory) memory instrumentation ---
+_DEBUG_MEM = True
+
+
+def _proc_mem_mb(field: str) -> float:
+    """Read a /proc/self/status memory field (e.g. 'VmRSS:') in MB; -1 if unavailable."""
+    try:
+        with open("/proc/self/status") as status:
+            for line in status:
+                if line.startswith(field):
+                    return int(line.split()[1]) / 1024  # kB -> MB
+    except OSError:
+        pass
+    return -1.0
+
+
+def _deep_size(obj: object, _seen: set[int] | None = None) -> int:
+    """Recursively size a JSON-like object graph in bytes, deduping shared refs by id."""
+    if _seen is None:
+        _seen = set()
+    oid = id(obj)
+    if oid in _seen:
+        return 0
+    _seen.add(oid)
+    size = sys.getsizeof(obj)
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            size += _deep_size(k, _seen) + _deep_size(v, _seen)
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        for item in obj:
+            size += _deep_size(item, _seen)
+    return size
 
 
 class AppleMusicAPIClient:
@@ -172,6 +207,9 @@ class AppleMusicAPIClient:
         limit = 50  # known-safe page size; larger pages 504 at deep offsets on heavy includes
         offset = 0
         all_items: list[dict] = []
+        dbg_next = 1500
+        if _DEBUG_MEM:
+            self.logger.warning("[MEMDEBUG] start %s rss=%.1fMB", endpoint, _proc_mem_mb("VmRSS:"))
         while True:
             kwargs["limit"] = limit
             kwargs["offset"] = offset
@@ -181,9 +219,28 @@ class AppleMusicAPIClient:
                 # collection or a 404; either way there is nothing to paginate.
                 break
             all_items += result[key]
+            if _DEBUG_MEM and len(all_items) >= dbg_next:
+                window = all_items[-150:]
+                self.logger.warning(
+                    "[MEMDEBUG] %s listed=%d rss=%.1fMB hwm=%.1fMB deepavg/track=%.0fB",
+                    endpoint,
+                    len(all_items),
+                    _proc_mem_mb("VmRSS:"),
+                    _proc_mem_mb("VmHWM:"),
+                    _deep_size(window) / len(window),
+                )
+                dbg_next += 1500
             if not result.get("next"):
                 break
             offset += limit
+        if _DEBUG_MEM:
+            self.logger.warning(
+                "[MEMDEBUG] done %s total=%d rss=%.1fMB hwm=%.1fMB",
+                endpoint,
+                len(all_items),
+                _proc_mem_mb("VmRSS:"),
+                _proc_mem_mb("VmHWM:"),
+            )
         return all_items
 
     async def get_user_storefront(self) -> str:

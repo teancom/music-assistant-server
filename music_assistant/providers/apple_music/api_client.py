@@ -57,7 +57,8 @@ class AppleMusicAPIClient:
 
     # Tuning knobs under observation: watch dev logs for 429s (raise period) or
     # "Apple Music API Timeout" 504s (lower the page limit in get_all_items).
-    throttler = ThrottlerManager(rate_limit=1, period=1, initial_backoff=15)
+    # period=0.5 -> 2 req/s.
+    throttler = ThrottlerManager(rate_limit=1, period=0.5, initial_backoff=15)
 
     def __init__(self, provider: AppleMusicProvider) -> None:
         """Initialize the API client."""
@@ -168,7 +169,7 @@ class AppleMusicAPIClient:
 
     async def get_all_items(self, endpoint: str, key: str = "data", **kwargs: Any) -> list[dict]:
         """Get all items from a paged list."""
-        limit = 100  # Apple's documented per-page maximum for library endpoints
+        limit = 75  # tuning: below Apple's 100 max to ease 504s on heavy include pages
         offset = 0
         all_items: list[dict] = []
         while True:

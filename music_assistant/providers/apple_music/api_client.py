@@ -169,7 +169,7 @@ class AppleMusicAPIClient:
 
     async def get_all_items(self, endpoint: str, key: str = "data", **kwargs: Any) -> list[dict]:
         """Get all items from a paged list."""
-        limit = 85  # tuning: below Apple's 100 max to ease 504s on heavy include pages
+        limit = 50  # known-safe page size; larger pages 504 at deep offsets on heavy includes
         offset = 0
         all_items: list[dict] = []
         while True:

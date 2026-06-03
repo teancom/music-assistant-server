@@ -90,7 +90,7 @@ class AppleMusicLibraryManager:
             )
             rating_response = await self.api.get_ratings(catalog_ids, MediaType.TRACK)
             returned_catalog_ids: set[str] = set()
-            for item in response["data"]:
+            for item in response.get("data", []):
                 returned_catalog_ids.add(item["id"])
                 is_favourite = rating_response.get(item["id"])
                 parsed_track = parse_track(self.provider, item, is_favourite)

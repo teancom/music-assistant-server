@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import functools
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Concatenate
 
+from aiohttp import ClientConnectionError, ClientPayloadError
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import (
     MediaNotFoundError,
-    MusicAssistantError,
     ResourceTemporarilyUnavailable,
 )
 
@@ -20,6 +22,34 @@ if TYPE_CHECKING:
     from .provider import AppleMusicProvider
 
 _APPLE_API_BASE = "https://api.music.apple.com/v1"
+
+# How many times to re-fetch a single page that came back truncated mid-pagination
+# before giving up and surfacing the failure.
+_PAGE_TRUNCATION_RETRIES = 3
+
+
+def _retry_transient_transport_errors[ClientT, **P, R](
+    func: Callable[Concatenate[ClientT, P], Awaitable[R]],
+) -> Callable[Concatenate[ClientT, P], Awaitable[R]]:
+    """
+    Convert transient aiohttp transport errors into the retryable error type.
+
+    A dropped connection or truncated body raises an ``aiohttp.ClientError`` (or
+    ``TimeoutError``) rather than an HTTP status, so it would otherwise bypass the
+    status-based retry handling. ``ClientResponseError`` (raised by
+    ``raise_for_status`` for genuine 4xx/5xx) is deliberately not caught here.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(self: ClientT, *args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            return await func(self, *args, **kwargs)
+        except (ClientConnectionError, ClientPayloadError, TimeoutError) as err:
+            raise ResourceTemporarilyUnavailable(
+                f"Transient transport error calling Apple Music: {err}"
+            ) from err
+
+    return wrapper
 
 
 class AppleMusicAPIClient:
@@ -41,6 +71,7 @@ class AppleMusicAPIClient:
         }
 
     @throttle_with_retries
+    @_retry_transient_transport_errors
     async def get_data(self, endpoint: str, **kwargs: Any) -> dict[str, Any]:
         """GET data from the Apple Music API."""
         url = f"{_APPLE_API_BASE}/{endpoint}"
@@ -67,7 +98,11 @@ class AppleMusicAPIClient:
                 )
                 raise ResourceTemporarilyUnavailable("Apple Music Rate Limiter")
             if response.status == 500:
-                raise MusicAssistantError("Unexpected server error when calling Apple Music")
+                # Apple 500s are typically transient (especially under load); retry rather
+                # than aborting the whole sync on a single hiccup.
+                raise ResourceTemporarilyUnavailable(
+                    "Unexpected server error when calling Apple Music"
+                )
             response.raise_for_status()
             return await response.json(loads=json_loads)
 
@@ -137,8 +172,10 @@ class AppleMusicAPIClient:
         while True:
             kwargs["limit"] = limit
             kwargs["offset"] = offset
-            result = await self.get_data(endpoint, **kwargs)
+            result = await self._get_page(endpoint, key, offset, kwargs)
             if key not in result:
+                # only reachable on the first page (offset 0): a genuinely empty
+                # collection or a 404; either way there is nothing to paginate.
                 break
             all_items += result[key]
             if not result.get("next"):
@@ -178,3 +215,27 @@ class AppleMusicAPIClient:
                 }
             )
         return results
+
+    async def _get_page(
+        self, endpoint: str, key: str, offset: int, kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        Fetch a single page of a paged listing, recovering from transient truncation.
+
+        Apple returns ``{}`` (HTTP 404) for a paged request that yields no payload. On the
+        first page (offset 0) that legitimately means an empty collection. Mid-pagination
+        (offset > 0, reached only after a prior page promised more via ``next``) it means a
+        transient truncation; accepting it would drop still-present items and trigger
+        spurious deletions, so re-fetch the same page a bounded number of times before
+        surfacing the failure.
+        """
+        result = await self.get_data(endpoint, **kwargs)
+        if key in result or offset == 0:
+            return result
+        for _ in range(_PAGE_TRUNCATION_RETRIES):
+            result = await self.get_data(endpoint, **kwargs)
+            if key in result:
+                return result
+        raise ResourceTemporarilyUnavailable(
+            f"Incomplete paged listing for {endpoint} at offset {offset}"
+        )

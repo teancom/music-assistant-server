@@ -37,6 +37,62 @@ class SessionHelper:
 
 
 @dataclass(kw_only=True)
+class PendingProgress:
+    """A locally-observed progress that has not been confirmed as synced to abs."""
+
+    position: float
+    duration: float
+    fully_played: bool
+    updated_at: float  # freshness signal for resume reconciliation; MA epoch seconds
+
+
+class ProgressOutbox:
+    """Holds the most recent progress per item that has not reached Audiobookshelf.
+
+    Audiobookshelf progress is a single last-writer-wins value per item, so only the
+    latest observation needs to be retained. Entries are kept while a sync is pending and
+    used for read-repair on resume, so a flaky MA<->abs connection does not lose progress
+    while playback (served from buffer) continues. Keyed by the mass item id.
+    """
+
+    def __init__(self, max_items: int = 100) -> None:
+        """Init."""
+        self._entries: dict[str, PendingProgress] = {}
+        self._max_items = max_items
+
+    def record(
+        self, key: str, *, position: float, duration: float, fully_played: bool
+    ) -> PendingProgress:
+        """Store/refresh the latest unsynced progress for an item; return the stored entry."""
+        if key not in self._entries and len(self._entries) >= self._max_items:
+            oldest = min(self._entries, key=lambda k: self._entries[k].updated_at)
+            del self._entries[oldest]
+        entry = PendingProgress(
+            position=position,
+            duration=duration,
+            fully_played=fully_played,
+            updated_at=time.time(),
+        )
+        self._entries[key] = entry
+        return entry
+
+    def get(self, key: str) -> PendingProgress | None:
+        """Return the pending progress for an item, if any."""
+        return self._entries.get(key)
+
+    def clear(self, key: str, entry: PendingProgress | None = None) -> None:
+        """Drop the pending progress for an item.
+
+        When ``entry`` is given this is a compare-and-clear: the entry is only removed if
+        it is still the current one. Since reports run as independent tasks, a slow write
+        completing after a newer report must not wipe the newer pending value.
+        """
+        if entry is not None and self._entries.get(key) is not entry:
+            return
+        self._entries.pop(key, None)
+
+
+@dataclass(kw_only=True)
 class _ProgressHelper:
     id_: str  # audiobook or podcast id
     episode_id: str | None = None

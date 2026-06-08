@@ -19,7 +19,7 @@ from aioaudiobookshelf.client.items import (
 from aioaudiobookshelf.client.items import PlaybackSessionExpanded as AbsPlaybackSessionExpanded
 from aioaudiobookshelf.client.items import PlaybackSessionParameters as AbsPlaybackSessionParameters
 from aioaudiobookshelf.client.session import SyncOpenSessionParameters
-from aioaudiobookshelf.exceptions import AbsError, RefreshTokenExpiredError
+from aioaudiobookshelf.exceptions import AbsApiError, AbsError, RefreshTokenExpiredError
 from aioaudiobookshelf.exceptions import (
     LoginError as AbsLoginError,
 )
@@ -68,7 +68,7 @@ from aioaudiobookshelf.schema.shelf import (
 )
 from aioaudiobookshelf.schema.shelf import ShelfId as AbsShelfId
 from aioaudiobookshelf.schema.shelf import ShelfType as AbsShelfType
-from aiohttp import web
+from aiohttp import ClientError, web
 from music_assistant_models.config_entries import (
     ConfigEntry,
     ConfigValueType,
@@ -125,7 +125,13 @@ from .constants import (
     AbsBrowseItemsPodcastTranslationKey,
     AbsBrowsePaths,
 )
-from .helpers import LibrariesHelper, LibraryHelper, ProgressGuard, SessionHelper
+from .helpers import (
+    LibrariesHelper,
+    LibraryHelper,
+    ProgressGuard,
+    ProgressOutbox,
+    SessionHelper,
+)
 
 if TYPE_CHECKING:
     from aioaudiobookshelf.schema.events_socket import LibraryItemRemoved
@@ -376,6 +382,9 @@ for more details.
 
         # progress guard
         self.progress_guard = ProgressGuard()
+
+        # retained progress that failed to reach abs (flaky connection), for retry/read-repair
+        self.progress_outbox = ProgressOutbox()
 
         # safe guard reauthentication
         self.reauthenticate_lock = asyncio.Lock()
@@ -981,6 +990,24 @@ for more details.
         # last_update is in ms epoch
         # If there is an open session, that session might have the old progress time,
         # whereas the explicit progress call above gives the most recent time.
+        pending = self.progress_outbox.get(item_id)
+        abs_update_s = progress.last_update / 1000 if progress and progress.last_update else None
+        # Freshness, not max position, wins so a rewind/re-listen counts as the true intent.
+        # The clock compare is only a backstop for external updates the socket callback didn't
+        # already clear; skew is tolerable since pending is seconds old vs minutes-stale abs.
+        if pending is not None and (abs_update_s is None or pending.updated_at > abs_update_s):
+            await self._flush_pending(item_id, abs_item_id, episode_id)
+            pending = self.progress_outbox.get(item_id) or pending
+            self.logger.debug("Resume position %s: from retained local progress.", pending.position)
+            return (
+                pending.fully_played,
+                int(pending.position * 1000),
+                from_utc_timestamp(pending.updated_at),
+            )
+
+        # abs is authoritative here (covers external updates); drop any superseded pending.
+        if pending is not None:
+            self.progress_outbox.clear(item_id)
         timestamp = from_utc_timestamp(progress.last_update / 1000) if progress else None
         current_time = (
             progress.current_time
@@ -1228,35 +1255,6 @@ for more details.
         We ignore PODCAST (function is called on adding a podcast with position=None)
 
         """
-
-        async def _update_by_session(session_helper: SessionHelper, duration: int) -> bool:
-            now = time.time()
-            time_listened = now - session_helper.last_sync_time
-            if time_listened > PLAYBACK_REPORT_INTERVAL_SECONDS * 2 + 10:
-                # See player_queues controller, we get an update every 30s, and immediately on pause
-                # or play.
-                # We reset after two missed updates, as this indicates a trigger after a longer
-                # absence and should not count into abs' statistics
-                self.logger.debug("Resetting time_listened due to longer absence.")
-                time_listened = 0.0
-            try:
-                await self._client.sync_open_session(
-                    session_id=session_helper.abs_session_id,
-                    parameters=SyncOpenSessionParameters(
-                        current_time=position,
-                        time_listened=time_listened,
-                        duration=duration,
-                    ),
-                )
-                session_helper.last_sync_time = now
-                self.logger.debug("Synced playback session, position %s s.", position)
-                return True
-            except AbsSessionSyncError:
-                self.logger.debug(
-                    "Was unable to sync session. Falling back to non-session approach."
-                )
-            return False
-
         if media_type == MediaType.PODCAST_EPISODE:
             abs_podcast_id, abs_episode_id = prov_item_id.split(" ")
 
@@ -1277,30 +1275,25 @@ for more details.
                 return
 
             if position == 0 and not fully_played:
-                # marked unplayed
+                # marked unplayed - discard any retained progress regardless of abs state,
+                # else a prior failed write would resurrect on resume
+                self.progress_outbox.clear(prov_item_id)
                 mp = await self._client.get_my_media_progress(
                     item_id=abs_podcast_id, episode_id=abs_episode_id
                 )
                 if mp is not None:
                     await self._client.remove_my_media_progress(media_progress_id=mp.id_)
                     self.logger.debug(f"Removed media progress of {media_type.value}.")
-                    return
+                return
 
-            duration = media_item.duration
-            updated = False
-            if session_helper := self.sessions.get(prov_item_id):
-                updated = await _update_by_session(session_helper=session_helper, duration=duration)
-            if not updated:
-                self.logger.debug(
-                    f"Updating media progress of {media_type.value}, title {media_item.name}."
-                )
-                await self._client.update_my_media_progress(
-                    item_id=abs_podcast_id,
-                    episode_id=abs_episode_id,
-                    duration_seconds=duration,
-                    progress_seconds=position,
-                    is_finished=fully_played,
-                )
+            await self._sync_progress_to_abs(
+                mass_item_id=prov_item_id,
+                abs_item_id=abs_podcast_id,
+                episode_id=abs_episode_id,
+                position=position,
+                duration=media_item.duration,
+                fully_played=fully_played,
+            )
 
         if media_type == MediaType.AUDIOBOOK:
             # guard, see progress guard class docstrings for explanation
@@ -1316,25 +1309,115 @@ for more details.
                 return
 
             if position == 0 and not fully_played:
-                # marked unplayed
+                # marked unplayed - discard any retained progress regardless of abs state,
+                # else a prior failed write would resurrect on resume
+                self.progress_outbox.clear(prov_item_id)
                 mp = await self._client.get_my_media_progress(item_id=prov_item_id)
                 if mp is not None:
                     await self._client.remove_my_media_progress(media_progress_id=mp.id_)
                     self.logger.debug(f"Removed media progress of {media_type.value}.")
                 return
 
-            duration = media_item.duration
-            updated = False
-            if session_helper := self.sessions.get(prov_item_id):
-                updated = await _update_by_session(session_helper=session_helper, duration=duration)
-            if not updated:
-                self.logger.debug(f"Updating {media_type.value} named {media_item.name} progress")
+            await self._sync_progress_to_abs(
+                mass_item_id=prov_item_id,
+                abs_item_id=prov_item_id,
+                episode_id=None,
+                position=position,
+                duration=media_item.duration,
+                fully_played=fully_played,
+            )
+
+    async def _sync_progress_to_abs(
+        self,
+        *,
+        mass_item_id: str,
+        abs_item_id: str,
+        episode_id: str | None,
+        position: int,
+        duration: int,
+        fully_played: bool,
+    ) -> None:
+        """Report progress to abs, retaining it for retry/read-repair if the sync fails.
+
+        Playback is served from buffer and unaffected by abs connectivity, so a failed
+        report must not be lost: the latest value is stashed and only cleared once abs
+        confirms the write.
+        """
+        entry = self.progress_outbox.record(
+            mass_item_id, position=position, duration=duration, fully_played=fully_played
+        )
+        try:
+            synced = False
+            if session_helper := self.sessions.get(mass_item_id):
+                synced = await self._update_by_session(
+                    session_helper=session_helper, position=position, duration=duration
+                )
+            if not synced:
+                self.logger.debug("Updating media progress of %s.", mass_item_id)
                 await self._client.update_my_media_progress(
-                    item_id=prov_item_id,
+                    item_id=abs_item_id,
+                    episode_id=episode_id,
                     duration_seconds=duration,
                     progress_seconds=position,
                     is_finished=fully_played,
                 )
+        except (AbsApiError, AbsSessionSyncError, ClientError, TimeoutError) as err:
+            # keep the pending entry; retried on the next report and on resume
+            self.logger.debug("Could not sync progress to abs, will retry: %s", err)
+            return
+        # pass entry so a newer report that landed during our write is not wiped
+        self.progress_outbox.clear(mass_item_id, entry)
+
+    async def _update_by_session(
+        self, *, session_helper: SessionHelper, position: int, duration: int
+    ) -> bool:
+        """Sync the open abs playback session; return False to fall back to a direct update."""
+        now = time.time()
+        time_listened = now - session_helper.last_sync_time
+        if time_listened > PLAYBACK_REPORT_INTERVAL_SECONDS * 2 + 10:
+            # See player_queues controller, we get an update every 30s, and immediately on pause
+            # or play.
+            # We reset after two missed updates, as this indicates a trigger after a longer
+            # absence and should not count into abs' statistics
+            self.logger.debug("Resetting time_listened due to longer absence.")
+            time_listened = 0.0
+        try:
+            await self._client.sync_open_session(
+                session_id=session_helper.abs_session_id,
+                parameters=SyncOpenSessionParameters(
+                    current_time=position,
+                    time_listened=time_listened,
+                    duration=duration,
+                ),
+            )
+        except (AbsApiError, AbsSessionSyncError, ClientError, TimeoutError):
+            self.logger.debug("Was unable to sync session. Falling back to non-session approach.")
+            return False
+        session_helper.last_sync_time = now
+        self.logger.debug("Synced playback session, position %s s.", position)
+        return True
+
+    async def _flush_pending(
+        self, mass_item_id: str, abs_item_id: str, episode_id: str | None
+    ) -> None:
+        """Best-effort push of a retained progress entry to abs (read-repair on resume)."""
+        pending = self.progress_outbox.get(mass_item_id)
+        if pending is None:
+            return
+        try:
+            self.progress_guard.add_progress(abs_item_id, episode_id)
+            await self._client.update_my_media_progress(
+                item_id=abs_item_id,
+                episode_id=episode_id,
+                duration_seconds=int(pending.duration),
+                progress_seconds=int(pending.position),
+                is_finished=pending.fully_played,
+            )
+        except (AbsApiError, AbsSessionSyncError, ClientError, TimeoutError) as err:
+            self.logger.debug("Could not flush retained progress to abs yet: %s", err)
+            return
+        # pass entry so a newer report that landed during our write is not wiped
+        self.progress_outbox.clear(mass_item_id, pending)
 
     @handle_refresh_token
     async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
@@ -1793,6 +1876,15 @@ for more details.
             return
 
         self.logger.debug(f"Updated progress of item {progress.library_item_id} via socket.")
+
+        # The guard above excludes our own recent writes, so this external update is
+        # authoritative: drop any retained local value so resume cannot prefer stale pending.
+        outbox_key = (
+            progress.library_item_id
+            if progress.episode_id is None
+            else f"{progress.library_item_id} {progress.episode_id}"
+        )
+        self.progress_outbox.clear(outbox_key)
 
         if progress.episode_id is None:
             await self._update_playlog_book(progress)

@@ -72,6 +72,9 @@ class AppleMusicStreamingManager:
         # protected assets. Only genuinely unencrypted assets lack a key server and may
         # be streamed directly.
         license_url = stream_metadata.get("hls-key-server-url")
+        self.logger.debug(
+            "stream_metadata keys for %s: %s", item_id, sorted(stream_metadata.keys())
+        )
         if not license_url:
             try:
                 stream_url = stream_metadata["assets"][0]["URL"]
@@ -233,7 +236,7 @@ class AppleMusicStreamingManager:
             "key-system": "com.widevine.alpha",
             "uri": uri,
             "adamId": item_id,
-            "isLibrary": False,
+            "isLibrary": is_library_id(item_id),
             "user-initiated": True,
         }
         async with self.provider.mass.http_session.post(

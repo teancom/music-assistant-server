@@ -99,12 +99,15 @@ class AppleMusicStreamingManager:
         if not stream_url or not uri:
             raise MediaNotFoundError("No stream URL found for song.")
         key_id = base64.b64decode(uri.split(",")[1])
+        # The license server keys on the catalog adamId; for library items this is the
+        # matched `songId`, not the library universal id we were given.
+        song_id = stream_metadata.get("songId", item_id)
         return StreamDetails(
             item_id=item_id,
             provider=self.provider.instance_id,
             audio_format=AudioFormat(content_type=ContentType.MP4, codec_type=ContentType.AAC),
             stream_type=StreamType.ENCRYPTED_HTTP,
-            decryption_key=await self._get_decryption_key(license_url, key_id, uri, item_id),
+            decryption_key=await self._get_decryption_key(license_url, key_id, uri, song_id),
             path=stream_url,
             can_seek=True,
             allow_seek=True,
@@ -236,7 +239,7 @@ class AppleMusicStreamingManager:
             "key-system": "com.widevine.alpha",
             "uri": uri,
             "adamId": item_id,
-            "isLibrary": is_library_id(item_id),
+            "isLibrary": False,
             "user-initiated": True,
         }
         async with self.provider.mass.http_session.post(

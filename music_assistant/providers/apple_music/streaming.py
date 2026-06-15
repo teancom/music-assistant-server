@@ -67,20 +67,17 @@ class AppleMusicStreamingManager:
     async def get_stream_details(self, item_id: str) -> StreamDetails:
         """Return StreamDetails for a single catalog or library track."""
         stream_metadata = await self._fetch_song_stream_metadata(item_id)
-        if is_library_id(item_id):
-            self.logger.debug(
-                "Library track %s assets: %s",
-                item_id,
-                [
-                    (a.get("flavor"), str(a.get("URL"))[:90])
-                    for a in stream_metadata.get("assets", [])
-                ],
-            )
+        # DRM is signalled by a key server, not by the id format: subscription tracks
+        # added to the library are encrypted just like catalog tracks and expose only
+        # protected assets. Only genuinely unencrypted assets lack a key server and may
+        # be streamed directly.
+        license_url = stream_metadata.get("hls-key-server-url")
+        if not license_url:
             try:
                 stream_url = stream_metadata["assets"][0]["URL"]
             except (KeyError, IndexError, TypeError) as exc:
                 raise MediaNotFoundError(
-                    f"Failed to extract stream URL for library track {item_id}: {exc}"
+                    f"Failed to extract stream URL for track {item_id}: {exc}"
                 ) from exc
             return StreamDetails(
                 item_id=item_id,
@@ -93,10 +90,8 @@ class AppleMusicStreamingManager:
             )
         if not self._decrypt_client_id or not self._decrypt_private_key:
             raise MediaNotFoundError(
-                "Widevine CDM files are not available. "
-                "Cannot stream encrypted catalog tracks without them."
+                "Widevine CDM files are not available. Cannot stream encrypted tracks without them."
             )
-        license_url = stream_metadata["hls-key-server-url"]
         stream_url, uri = await self._parse_stream_url_and_uri(stream_metadata["assets"])
         if not stream_url or not uri:
             raise MediaNotFoundError("No stream URL found for song.")

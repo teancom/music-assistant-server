@@ -68,6 +68,14 @@ class AppleMusicStreamingManager:
         """Return StreamDetails for a single catalog or library track."""
         stream_metadata = await self._fetch_song_stream_metadata(item_id)
         if is_library_id(item_id):
+            self.logger.debug(
+                "Library track %s assets: %s",
+                item_id,
+                [
+                    (a.get("flavor"), str(a.get("URL"))[:90])
+                    for a in stream_metadata.get("assets", [])
+                ],
+            )
             try:
                 stream_url = stream_metadata["assets"][0]["URL"]
             except (KeyError, IndexError, TypeError) as exc:

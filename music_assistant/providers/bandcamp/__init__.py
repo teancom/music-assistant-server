@@ -1,6 +1,7 @@
 """Bandcamp music provider support for MusicAssistant."""
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
 from typing import cast
@@ -223,12 +224,31 @@ class BandcampProvider(MusicProvider):
         :param older_than_token: Pagination cursor from the previous page.
         :param fan_id: Fan ID to query. None = authenticated user.
         """
+        start_time = time.monotonic()
+        self.logger.debug(
+            "Bandcamp collection page fetch start: type=%s fan_id=%s older_than_token=%s",
+            collection_type.value,
+            fan_id,
+            older_than_token,
+        )
         try:
-            return await self._client.get_collection_items(
+            page = await self._client.get_collection_items(
                 collection_type,
                 older_than_token=older_than_token,
                 fan_id=fan_id,
             )
+            self.logger.debug(
+                "Bandcamp collection page fetch done: type=%s fan_id=%s older_than_token=%s "
+                "items=%d has_more=%s last_token=%s elapsed_ms=%.1f",
+                collection_type.value,
+                fan_id,
+                older_than_token,
+                len(page.items),
+                page.has_more,
+                page.last_token,
+                (time.monotonic() - start_time) * 1000,
+            )
+            return page
         except BandcampRateLimitError as error:
             raise RateLimited(
                 "Bandcamp rate limit reached", backoff_time=error.retry_after
@@ -247,28 +267,57 @@ class BandcampProvider(MusicProvider):
         all_items: list[CollectionItem | FollowingItem | FanItem] = []
         older_than_token: str | None = None
         seen_tokens: set[str] = set()
+        page_number = 0
+        start_time = time.monotonic()
+        self.logger.debug(
+            "Bandcamp collection fetch start: type=%s fan_id=%s",
+            collection_type.value,
+            fan_id,
+        )
         while True:
+            page_number += 1
             page = await self._fetch_collection_page(collection_type, older_than_token, fan_id)
             all_items.extend(page.items)
+            item_types: dict[str, int] = {}
+            for item in page.items:
+                item_type = getattr(item, "item_type", type(item).__name__)
+                item_types[item_type] = item_types.get(item_type, 0) + 1
             self.logger.debug(
-                "Fetched %d items for %s (has_more=%s, last_token=%s, total=%d)",
-                len(page.items),
+                "Bandcamp collection page processed: type=%s fan_id=%s page=%d "
+                "page_items=%d item_types=%s has_more=%s last_token=%s total=%d elapsed_ms=%.1f",
                 collection_type.value,
+                fan_id,
+                page_number,
+                len(page.items),
+                item_types,
                 page.has_more,
                 page.last_token,
                 len(all_items),
+                (time.monotonic() - start_time) * 1000,
             )
             if not page.has_more or not page.last_token:
                 break
             if page.last_token in seen_tokens:
                 self.logger.warning(
-                    "Pagination loop detected for %s: token %s already seen, stopping",
+                    "Pagination loop detected for %s fan_id=%s page=%d: token %s already seen, "
+                    "stopping after %d items",
                     collection_type.value,
+                    fan_id,
+                    page_number,
                     page.last_token,
+                    len(all_items),
                 )
                 break
             seen_tokens.add(page.last_token)
             older_than_token = page.last_token
+        self.logger.debug(
+            "Bandcamp collection fetch done: type=%s fan_id=%s pages=%d total=%d elapsed_ms=%.1f",
+            collection_type.value,
+            fan_id,
+            page_number,
+            len(all_items),
+            (time.monotonic() - start_time) * 1000,
+        )
         return all_items
 
     async def get_library_artists(self) -> AsyncGenerator[Artist]:
@@ -551,19 +600,47 @@ class BandcampProvider(MusicProvider):
 
         :param path: The path to browse, (e.g. provider_id://artists).
         """
+        start_time = time.monotonic()
         subpath = path.split("://")[1] if "://" in path else ""
         # Filter empty segments from double-slashes or trailing slashes
         path_parts = [p for p in subpath.split("/") if p]
         base = f"{self.instance_id}://"
+        self.logger.debug(
+            "Bandcamp browse start: path=%s path_parts=%s identity=%s",
+            path,
+            path_parts,
+            bool(self._client.identity),
+        )
 
         # Route fan/follower paths (supports arbitrary nesting depth)
         if path_parts and path_parts[0] in (BROWSE_FANS, BROWSE_FOLLOWERS):
-            return await self._browse_person(path_parts, base)
+            result = await self._browse_person(path_parts, base)
+            self.logger.debug(
+                "Bandcamp browse done: path=%s route=person result_count=%d elapsed_ms=%.1f",
+                path,
+                len(result),
+                (time.monotonic() - start_time) * 1000,
+            )
+            return result
 
         if path_parts == [BROWSE_WISHLIST]:
-            return await self._browse_person_content(None, CollectionType.WISHLIST)
+            result = await self._browse_person_content(None, CollectionType.WISHLIST)
+            self.logger.debug(
+                "Bandcamp browse done: path=%s route=wishlist result_count=%d elapsed_ms=%.1f",
+                path,
+                len(result),
+                (time.monotonic() - start_time) * 1000,
+            )
+            return result
         if path_parts == [BROWSE_FOLLOWING]:
-            return await self._browse_person_following(None)
+            result = await self._browse_person_following(None)
+            self.logger.debug(
+                "Bandcamp browse done: path=%s route=following result_count=%d elapsed_ms=%.1f",
+                path,
+                len(result),
+                (time.monotonic() - start_time) * 1000,
+            )
+            return result
 
         # Delegate standard library paths and root listing to the base class
         result = list(await super().browse(path))
@@ -589,6 +666,12 @@ class BandcampProvider(MusicProvider):
                     )
                 )
 
+        self.logger.debug(
+            "Bandcamp browse done: path=%s route=base/root result_count=%d elapsed_ms=%.1f",
+            path,
+            len(result),
+            (time.monotonic() - start_time) * 1000,
+        )
         return result
 
     async def _browse_person(
@@ -600,6 +683,7 @@ class BandcampProvider(MusicProvider):
 
         Pattern: (fans|followers)[/{id}[/(collection|wishlist|following|fans|followers)]*]
         """
+        self.logger.debug("Bandcamp person browse route start: path_parts=%s", path_parts)
         # Top-level: authenticated user's fans or followers
         if len(path_parts) == 1:
             collection_type = (
@@ -652,17 +736,40 @@ class BandcampProvider(MusicProvider):
         or if it is a known sub-route name (e.g. "collection", "wishlist").
         """
         if segment in self._slug_to_fan_id:
+            self.logger.debug(
+                "Bandcamp person segment resolved from slug cache: segment=%s fan_id=%s",
+                segment,
+                self._slug_to_fan_id[segment],
+            )
             return self._slug_to_fan_id[segment]
         try:
-            return int(segment)
+            person_id = int(segment)
+            self.logger.debug("Bandcamp person segment resolved as numeric: segment=%s", segment)
+            return person_id
         except ValueError:
             pass
         # Known sub-route names are structural, not user slugs
         if segment in PERSON_SUB_ROUTES:
+            self.logger.debug(
+                "Bandcamp person segment is sub-route, not person: segment=%s", segment
+            )
             return None
         # Slug not in cache and not numeric — rebuild from parent lists and retry
+        self.logger.debug(
+            "Bandcamp person segment unresolved; rebuilding slug cache: segment=%s slug_cache_size=%d",
+            segment,
+            len(self._slug_to_fan_id),
+        )
         await self._rebuild_slug_cache()
-        return self._slug_to_fan_id.get(segment)
+        resolved = self._slug_to_fan_id.get(segment)
+        self.logger.debug(
+            "Bandcamp person segment resolved after slug cache rebuild: segment=%s fan_id=%s "
+            "slug_cache_size=%d",
+            segment,
+            resolved,
+            len(self._slug_to_fan_id),
+        )
+        return resolved
 
     async def _rebuild_slug_cache(self) -> None:
         """Re-fetch fan/follower lists to rebuild the slug→fan_id map."""
@@ -755,28 +862,93 @@ class BandcampProvider(MusicProvider):
 
         :param person_id: Person to query. None = authenticated user.
         """
+        start_time = time.monotonic()
         cache_key = f"_browse_person_content_{person_id}_{collection_type.value}"
+        self.logger.debug(
+            "Bandcamp person content browse start: person_id=%s type=%s cache_key=%s",
+            person_id,
+            collection_type.value,
+            cache_key,
+        )
         cached = await self.mass.cache.get(cache_key, provider=self.instance_id)
         if cached is not None:
+            self.logger.debug(
+                "Bandcamp person content cache hit: person_id=%s type=%s cached_count=%d",
+                person_id,
+                collection_type.value,
+                len(cached),
+            )
             try:
-                return [self._deserialize_content_item(item) for item in cached]
+                cached_results = [self._deserialize_content_item(item) for item in cached]
+                self.logger.debug(
+                    "Bandcamp person content cache deserialize done: person_id=%s type=%s "
+                    "result_count=%d elapsed_ms=%.1f",
+                    person_id,
+                    collection_type.value,
+                    len(cached_results),
+                    (time.monotonic() - start_time) * 1000,
+                )
+                return cached_results
             except (LookupError, ValueError, UnserializableDataError, InvalidDataError):
                 self.logger.warning("Stale cache for %s, fetching fresh", cache_key)
+        else:
+            self.logger.debug(
+                "Bandcamp person content cache miss: person_id=%s type=%s",
+                person_id,
+                collection_type.value,
+            )
         results: list[Album | Track] = []
         context = f"Failed to get {collection_type.value} for person {person_id}"
         async with self._map_api_errors(context):
             items = await self._get_all_collection_items(collection_type, fan_id=person_id)
+            item_types: dict[str, int] = {}
             for item in items:
+                item_types[item.item_type] = item_types.get(item.item_type, 0) + 1
+            self.logger.debug(
+                "Bandcamp person content converting: person_id=%s type=%s fetched_count=%d "
+                "item_types=%s elapsed_ms=%.1f",
+                person_id,
+                collection_type.value,
+                len(items),
+                item_types,
+                (time.monotonic() - start_time) * 1000,
+            )
+            for index, item in enumerate(items, start=1):
+                before_count = len(results)
                 with suppress(MediaNotFoundError):
                     if item.item_type == "album":
                         results.append(await self.get_album(f"{item.band_id}-{item.item_id}"))
                     elif item.item_type == "track":
                         results.append(await self.get_track(f"{item.band_id}-0-{item.item_id}"))
+                if index == len(items) or index % 25 == 0:
+                    self.logger.debug(
+                        "Bandcamp person content conversion progress: person_id=%s type=%s "
+                        "processed=%d/%d converted=%d last_item_type=%s last_item_id=%s "
+                        "converted_last=%s elapsed_ms=%.1f",
+                        person_id,
+                        collection_type.value,
+                        index,
+                        len(items),
+                        len(results),
+                        item.item_type,
+                        item.item_id,
+                        len(results) > before_count,
+                        (time.monotonic() - start_time) * 1000,
+                    )
         await self.mass.cache.set(
             cache_key,
             [item.to_dict() for item in results],
             expiration=CACHE_USER_LISTS if results else CACHE_EMPTY_RESULTS,
             provider=self.instance_id,
+        )
+        self.logger.debug(
+            "Bandcamp person content browse done: person_id=%s type=%s result_count=%d "
+            "cache_expiration=%s elapsed_ms=%.1f",
+            person_id,
+            collection_type.value,
+            len(results),
+            CACHE_USER_LISTS if results else CACHE_EMPTY_RESULTS,
+            (time.monotonic() - start_time) * 1000,
         )
         return results
 
@@ -786,27 +958,65 @@ class BandcampProvider(MusicProvider):
 
         :param person_id: Person to query. None = authenticated user.
         """
+        start_time = time.monotonic()
         cache_key = f"_browse_person_following_{person_id}"
+        self.logger.debug(
+            "Bandcamp person following browse start: person_id=%s cache_key=%s",
+            person_id,
+            cache_key,
+        )
         cached = await self.mass.cache.get(cache_key, provider=self.instance_id, base_class=Artist)
         if cached is not None:
+            self.logger.debug(
+                "Bandcamp person following cache hit: person_id=%s cached_count=%d elapsed_ms=%.1f",
+                person_id,
+                len(cached),
+                (time.monotonic() - start_time) * 1000,
+            )
             return cached  # type: ignore[no-any-return]
+        self.logger.debug("Bandcamp person following cache miss: person_id=%s", person_id)
         artists: list[Artist] = []
         async with self._map_api_errors(f"Failed to get following for person {person_id}"):
             collection = await self._get_all_collection_items(
                 CollectionType.FOLLOWING, fan_id=person_id
             )
-            for item in collection:
+            self.logger.debug(
+                "Bandcamp person following converting: person_id=%s fetched_count=%d elapsed_ms=%.1f",
+                person_id,
+                len(collection),
+                (time.monotonic() - start_time) * 1000,
+            )
+            for index, item in enumerate(collection, start=1):
                 try:
                     artists.append(await self.get_artist(item.band_id))
                 except MediaNotFoundError:
                     self.logger.warning(
                         "Artist not found for band_id %s (%s)", item.band_id, item.name
                     )
+                if index == len(collection) or index % 25 == 0:
+                    self.logger.debug(
+                        "Bandcamp person following conversion progress: person_id=%s "
+                        "processed=%d/%d converted=%d last_band_id=%s elapsed_ms=%.1f",
+                        person_id,
+                        index,
+                        len(collection),
+                        len(artists),
+                        item.band_id,
+                        (time.monotonic() - start_time) * 1000,
+                    )
         await self.mass.cache.set(
             cache_key,
             [a.to_dict() for a in artists],
             expiration=CACHE_USER_LISTS if artists else CACHE_EMPTY_RESULTS,
             provider=self.instance_id,
+        )
+        self.logger.debug(
+            "Bandcamp person following browse done: person_id=%s result_count=%d "
+            "cache_expiration=%s elapsed_ms=%.1f",
+            person_id,
+            len(artists),
+            CACHE_USER_LISTS if artists else CACHE_EMPTY_RESULTS,
+            (time.monotonic() - start_time) * 1000,
         )
         return artists
 
@@ -823,27 +1033,70 @@ class BandcampProvider(MusicProvider):
         :param base_path: Browse path prefix for the resulting folder links.
         :param person_id: Person to query. None = authenticated user.
         """
+        start_time = time.monotonic()
         # base_path included intentionally: folder links differ per navigation path.
         cache_key = f"_browse_person_people_{person_id}_{collection_type.value}_{base_path}"
+        self.logger.debug(
+            "Bandcamp person people browse start: person_id=%s type=%s base_path=%s cache_key=%s",
+            person_id,
+            collection_type.value,
+            base_path,
+            cache_key,
+        )
         cached = await self.mass.cache.get(
             cache_key, provider=self.instance_id, base_class=BrowseFolder
         )
         if cached is not None:
+            rebuilt_slug_count = 0
             for folder in cached:
                 segment = folder.path.rstrip("/").rsplit("/", 1)[-1]
                 fan_id_str = folder.item_id.removeprefix("person_")
                 with suppress(ValueError):
                     self._slug_to_fan_id[segment] = int(fan_id_str)
+                    rebuilt_slug_count += 1
+            self.logger.debug(
+                "Bandcamp person people cache hit: person_id=%s type=%s cached_count=%d "
+                "rebuilt_slug_count=%d elapsed_ms=%.1f",
+                person_id,
+                collection_type.value,
+                len(cached),
+                rebuilt_slug_count,
+                (time.monotonic() - start_time) * 1000,
+            )
             return cached  # type: ignore[no-any-return]
+        self.logger.debug(
+            "Bandcamp person people cache miss: person_id=%s type=%s base_path=%s",
+            person_id,
+            collection_type.value,
+            base_path,
+        )
         context = f"Failed to get {collection_type.value} for person {person_id}"
         async with self._map_api_errors(context):
             collection = await self._get_all_collection_items(collection_type, fan_id=person_id)
+            self.logger.debug(
+                "Bandcamp person people converting: person_id=%s type=%s fetched_count=%d "
+                "elapsed_ms=%.1f",
+                person_id,
+                collection_type.value,
+                len(collection),
+                (time.monotonic() - start_time) * 1000,
+            )
             folders = self._people_to_folders(collection, base_path)
         await self.mass.cache.set(
             cache_key,
             [f.to_dict() for f in folders],
             expiration=CACHE_USER_LISTS if folders else CACHE_EMPTY_RESULTS,
             provider=self.instance_id,
+        )
+        self.logger.debug(
+            "Bandcamp person people browse done: person_id=%s type=%s result_count=%d "
+            "slug_cache_size=%d cache_expiration=%s elapsed_ms=%.1f",
+            person_id,
+            collection_type.value,
+            len(folders),
+            len(self._slug_to_fan_id),
+            CACHE_USER_LISTS if folders else CACHE_EMPTY_RESULTS,
+            (time.monotonic() - start_time) * 1000,
         )
         return folders
 

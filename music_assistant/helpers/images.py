@@ -104,9 +104,33 @@ def detect_image_content_format(data: bytes) -> str | None:
     return None
 
 
+def _is_expiring_remote_url(path_or_url: str) -> bool:
+    """Return whether a remote URL contains an AWS-style expiring signature."""
+    if not path_or_url.startswith(("http://", "https://")):
+        return False
+    query_keys = urllib.parse.parse_qs(urllib.parse.urlparse(path_or_url).query)
+    return any(key.lower().startswith("x-amz-") for key in query_keys)
+
+
+def _normalize_image_cache_path(path_or_url: str) -> str:
+    """Remove volatile AWS signature parameters before deriving an image cache key."""
+    if not _is_expiring_remote_url(path_or_url):
+        return path_or_url
+    parsed_url = urllib.parse.urlparse(path_or_url)
+    # only drop the signature parameters; other query parameters may select
+    # a distinct image variant and must remain part of the cache key
+    stable_params = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True)
+        if not key.lower().startswith("x-amz-")
+    ]
+    query = urllib.parse.urlencode(stable_params)
+    return parsed_url._replace(query=query, fragment="").geturl()
+
+
 def create_thumb_hash(provider: str, path_or_url: str) -> str:
     """Create a safe filesystem hash from provider and image path."""
-    raw = f"{provider}/{path_or_url}"
+    raw = f"{provider}/{_normalize_image_cache_path(path_or_url)}"
     return hashlib.sha256(raw.encode(), usedforsecurity=False).hexdigest()
 
 
@@ -342,12 +366,15 @@ async def _fetch_and_cache_source_image(
 
     def _read_disk_entry() -> bytes | None:
         # remote urls only count as fresh within the TTL (a CDN can serve new
-        # content behind a stable url); local files rely on invalidation instead
+        # content behind a stable url); local files rely on invalidation instead.
+        # signed (expiring) urls are exempt from the TTL: the signature churns
+        # but the bytes behind the stable blob path are immutable
         try:
             if not os.path.isfile(filepath):
                 return None
             if (
                 path_or_url.startswith("http")
+                and not _is_expiring_remote_url(path_or_url)
                 and time.time() - Path(filepath).stat().st_mtime > _SOURCE_CACHE_TTL
             ):
                 return None

@@ -131,6 +131,10 @@ def setup_logger(data_path: str, level: str = "DEBUG") -> logging.Logger:
 
     # apply the configured global log level to the (root) music assistant logger
     logging.getLogger(MASS_LOGGER_NAME).setLevel(level)
+    # and to the sendspin server library: its streaming internals only log at
+    # DEBUG, so leaving it at the root default hides them even when the server
+    # is configured for debug output
+    logging.getLogger("aiosendspin").setLevel(level)
 
     # silence some noisy loggers
     logging.getLogger("asyncio").setLevel(logging.WARNING)

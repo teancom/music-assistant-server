@@ -562,7 +562,7 @@ class SendspinLocalAudioBridge:
     def _static_delay_us(self) -> int:
         """Return the configured static playback delay in microseconds."""
         if self._bridge_role is not None:
-            return self._bridge_role.get_static_delay_us()
+            return self._bridge_role.get_output_delay_us()
         return 0
 
     def _apply_format_conversion(self, pcm_data: bytes) -> bytes:
